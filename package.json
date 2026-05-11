@@ -1,0 +1,14 @@
+{
+  "name": "ecommerce-after-sales-copilot",
+  "private": true,
+  "version": "0.1.0",
+  "description": "A Next.js + FastAPI + LangGraph agent project for ecommerce after-sales data analysis.",
+  "workspaces": [
+    "apps/web"
+  ],
+  "scripts": {
+    "dev:web": "npm --workspace apps/web run dev",
+    "build:web": "npm --workspace apps/web run build",
+    "lint:web": "npm --workspace apps/web run lint"
+  }
+}
