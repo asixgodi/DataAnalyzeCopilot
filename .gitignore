@@ -18,6 +18,7 @@ out/
 dist/
 build/
 .turbo/
+*.tsbuildinfo
 
 # Test and coverage
 coverage/
@@ -38,3 +39,7 @@ logs/
 Thumbs.db
 .vscode/
 .idea/
+
+# Documentation and plans
+docs/
+agent-20-day-plan.md

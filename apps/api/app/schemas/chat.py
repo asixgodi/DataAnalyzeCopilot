@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -6,10 +8,36 @@ class ChatRequest(BaseModel):
     session_id: str | None = None
 
 
+class Citation(BaseModel):
+    doc_id: str
+    title: str
+    chunk_id: str
+    snippet: str
+    score: float
+
+
+class SqlResult(BaseModel):
+    sql: str
+    columns: list[str]
+    rows: list[dict[str, Any]]
+    row_count: int
+    error: str | None = None
+
+
 class TraceStep(BaseModel):
     node_name: str
+    agent_role: str = "system"
     status: str
     detail: str
+    latency_ms: float = 0
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class Metrics(BaseModel):
+    latency_ms: float
+    tool_calls: int
+    citations: int
+    route_confidence: float
 
 
 class ChatResponse(BaseModel):
@@ -17,3 +45,7 @@ class ChatResponse(BaseModel):
     route: str
     trace_id: str
     steps: list[TraceStep]
+    citations: list[Citation] = Field(default_factory=list)
+    sql_result: SqlResult | None = None
+    metrics: Metrics
+    memory: dict[str, Any] = Field(default_factory=dict)

@@ -1,97 +1,121 @@
 # 电商售后数据分析 Copilot
 
-这是一个面向 AI Agent 应用开发实习投递的全栈工程项目。项目目标不是做一个泛泛聊天机器人，而是做一个能处理电商售后业务问题的业务分析助手：用户用自然语言提问，系统自动判断是否需要查询结构化数据库、检索非结构化业务文档，或同时执行两条路径，最后给出带数据、证据、执行链路和评估指标的回答。
+这是一个面向面试展示的全栈 Agent MVP。项目不是泛聊天机器人，而是一个能处理电商售后业务问题的分析助手：用户用自然语言提问，系统自动路由到 SQL、RAG 或混合分析链路，并返回答案、SQL、文档证据、执行链路、记忆状态和基础评估指标。
 
-## 项目定位
+## 项目能做什么
 
-用户示例问题：
+- 自然语言查询结构化售后数据库，例如“4月服装类商品退款率是多少？”
+- 检索非结构化业务知识库，例如“退款率指标口径是什么？”
+- 对需要数据和文档证据的问题走 Hybrid 链路，例如“4月服装类商品退款率为什么升高？”
+- 展示 Router、SQLAgent、RAGAgent、MemoryAgent、EvaluatorAgent 的执行过程。
+- 提供 smoke test 和 eval endpoint，用于验证路由、回答和基本回归指标。
 
-```text
-4 月服装类商品退款率为什么升高？请结合数据和退款政策给出分析。
-```
+## 技术选型
 
-系统预期流程：
+- 前端：Next.js、React、TypeScript
+- 后端：FastAPI、Pydantic
+- 数据库：SQLite 模拟电商售后结构化数据
+- 知识库：Markdown 文档 + 本地检索
+- Agent 能力：任务路由、SQL 工具、RAG 工具、会话记忆、Trace、Eval
 
-```text
-自然语言问题
--> 任务分类与路由
--> SQL 分支查询订单、商品、退款、评价、客服工单等数据
--> RAG 分支检索退款政策、售后 SOP、指标口径等文档
--> 合并结构化数据和文档证据
--> 输出分析结论、SQL、引用来源、执行链路、耗时和工具调用记录
-```
-
-## 为什么使用模拟数据
-
-本项目使用模拟电商售后业务数据，重点验证 Agent 在结构化数据查询、非结构化知识检索、工具调用、执行链路追踪和自动评估上的工程能力。真实落地时，只需要替换数据库连接、业务文档和权限系统即可。
-
-## 技术栈
-
-```text
-前端：Next.js / React / TypeScript / Tailwind CSS
-后端：Python / FastAPI / Pydantic
-Agent：LangGraph / Tool Calling / Text2SQL / RAG
-数据：SQLite / Chroma 或 FAISS
-工程化：Docker Compose / 结构化日志 / Trace ID / Eval Harness
-```
-
-## 当前进度
-
-第 1 天已完成项目定位和基础骨架：
-
-- 初始化 monorepo 目录结构。
-- 创建 Next.js 前端骨架。
-- 创建 FastAPI 后端骨架。
-- 补充环境变量示例。
-- 补充技术选型文档。
-- 补充系统架构草图。
-- 使用 Git 管理项目。
+当前版本优先完成可运行闭环。真实企业落地时，可以把本地规则路由替换为 LangGraph，把 Markdown 检索替换为 ChromaDB/FAISS + Embedding，把 SQLite 替换为 MySQL/PostgreSQL。
 
 ## 目录结构
 
 ```text
-enterprise-data-copilot/
-  apps/
-    web/
-      app/
-      components/
-      lib/
-      stores/
-    api/
-      app/
-        main.py
-        api/
-        core/
-        schemas/
-        services/
-  data/
-    documents/
-  docs/
-    architecture.md
-    day-1-jd-keywords.md
-    tech-selection.md
-  scripts/
-  .env.example
-  package.json
+apps/
+  api/                 FastAPI 后端
+    app/
+      api/             HTTP 路由
+      schemas/         请求和响应模型
+      services/        Agent、SQL、RAG、Memory、Trace、Eval
+  web/                 Next.js 前端控制台
+data/
+  documents/           模拟企业知识库 Markdown
+  demo.db              首次运行后自动生成的 SQLite 数据库
+docs/
+  task-complete-mvp.md 工程化需求对齐文档
+scripts/
+  smoke_test.py        端到端冒烟测试
 ```
 
-## 本地启动
+## 后端启动
 
-前端依赖安装后启动：
+```powershell
+cd D:\yjs\front\agent\apps\api
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --port 8000
+```
 
-```bash
-npm install
+访问：
+
+- Health check: http://127.0.0.1:8000/health
+- API docs: http://127.0.0.1:8000/docs
+
+## 前端启动
+
+```powershell
+cd D:\yjs\front\agent
 npm run dev:web
 ```
 
-后端依赖安装后启动：
+访问：
 
-```bash
-cd apps/api
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8000
+- Web: http://localhost:3000
+
+如后端端口不是 8000，可以在 `apps/web/.env.local` 中配置：
+
+```text
+NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
 ```
 
-当前第 1 天主要完成项目骨架。后续会逐步接入真实 LangGraph workflow、SQL tools、RAG pipeline、trace 面板和自动评估脚本。
+## 验收方式
+
+后端冒烟测试：
+
+```powershell
+cd D:\yjs\front\agent
+.\apps\api\.venv\Scripts\python.exe -B scripts\smoke_test.py
+```
+
+前端构建：
+
+```powershell
+cd D:\yjs\front\agent
+npm run build:web
+```
+
+接口评估：
+
+```powershell
+curl -X POST http://127.0.0.1:8000/api/eval/run
+```
+
+## Chroma 文档入库
+
+真实 RAG 入库前，先复制 `apps/api/.env.example` 为 `apps/api/.env`，并填入 `SILICONFLOW_API_KEY`。
+
+先查看 chunk 切分效果，不调用模型：
+
+```powershell
+cd D:\yjs\front\agent
+.\apps\api\.venv\Scripts\python.exe scripts\ingest_documents.py --dry-run
+```
+
+确认切分效果后，写入 Chroma：
+
+```powershell
+.\apps\api\.venv\Scripts\python.exe scripts\ingest_documents.py --reset
+```
+
+切分策略说明见：
+
+```text
+docs/rag-chunking-and-chroma.md
+```
+
+## 已知限制
+
+- 当前是本地确定性 MVP，没有调用真实 LLM。
+- RAG 使用本地轻量检索，尚未接入 Embedding、向量数据库和 RRF。
+- 记忆系统保存在进程内，服务重启后会丢失。
+- 数据是模拟电商售后数据，适合展示工程闭环和面试讲解，不代表真实企业数据。

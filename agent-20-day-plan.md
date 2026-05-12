@@ -362,6 +362,7 @@ START
 - 掌握 LangGraph 的最小工作流。
 - 理解 State、Node、Edge、END。
 - 把 mock agent 替换成 LangGraph workflow。
+- 初步建立“多角色节点协作”的意识：先用节点表达不同职责，不急着堆复杂 Multi-Agent。
 
 ### 要做的事
 
@@ -371,17 +372,25 @@ START
 - 写 `finalize_response` 节点。
 - 用普通边串起来。
 - 在 FastAPI 中调用 LangGraph workflow。
+- 在设计文档中标出后续会拆分出的核心角色：
+  - `RouterAgent`：判断 SQL / RAG / Hybrid / Clarification。
+  - `SQLAgent`：负责结构化数据查询。
+  - `RAGAgent`：负责文档检索和引用证据。
+  - `MemoryAgent`：负责多轮上下文和摘要，先预留。
+  - `EvaluatorAgent`：负责答案质量检查，先预留。
 
 ### 今日产出
 
 - 第一个 LangGraph workflow。
 - 后端 `/api/chat` 使用 LangGraph 返回答案。
+- `docs/agent_roles.md`：记录多角色节点职责，不要求当天全部实现。
 
 ### 验收标准
 
 - 能画出当前 graph。
 - 能解释 State 在节点之间怎么传递。
 - 前端调用的已经是 LangGraph 后端。
+- 能解释为什么先用 LangGraph 节点表达多角色协作，而不是一开始就做复杂 Multi-Agent。
 
 ## 第 7 天：Conditional Edge 和任务路由
 
@@ -390,6 +399,7 @@ START
 - 掌握 Agent 流程控制的核心。
 - 用条件边控制 SQL、RAG、追问三类路径。
 - 让 Agent 不再是线性脚本。
+- 让 `RouterAgent` 成为项目的第一个明确角色节点。
 
 ### 要做的事
 
@@ -402,11 +412,14 @@ START
 - 实现 `route_task` 条件边。
 - 路由到 `sql_entry`、`rag_entry`、`ask_clarification`。
 - 写 10 个问题测试路由效果。
+- 增加 `hybrid` 路由，为后续 SQL + RAG 混合问题做准备。
+- 记录每次路由的决策理由，例如为什么查数据库、为什么查文档、为什么两者都查、为什么需要追问。
 
 ### 今日产出
 
 - 可路由 LangGraph Agent。
 - `routing_test_cases.md`。
+- `router_decision_examples.md`。
 
 ### 验收标准
 
@@ -414,6 +427,7 @@ START
 - 文档类问题能进入 RAG 分支。
 - 模糊问题能进入追问分支。
 - 能解释 conditional edge 为什么是 Agent 工程核心。
+- 能解释 RouterAgent 如何降低模型“随便调用工具”的风险。
 
 ## 第 8 天：数据库和 Text2SQL 工具
 
@@ -486,6 +500,7 @@ START
 - 做出非结构化文档问答能力。
 - 掌握 RAG 的基本链路。
 - 输出答案时带引用证据。
+- 为后续检索增强预留 Multi Query 和相邻 chunk 扩展接口。
 
 ### 要做的事
 
@@ -502,17 +517,21 @@ START
 - 建立 Chroma 或 FAISS 向量库。
 - 实现 `retrieve_docs`。
 - 实现 `generate_answer_with_citations`。
+- 在检索结果中保留 `doc_id`、`chunk_id`、`prev_chunk_id`、`next_chunk_id`、`score`、`metadata`。
+- 先实现一个简单的相邻 chunk 扩展策略：命中某个 chunk 后，可选带上前后相邻片段，避免上下文断裂。
 
 ### 今日产出
 
 - RAG pipeline。
 - 文档引用答案。
+- `rag_design.md`：记录 chunk、metadata、citation、相邻 chunk 扩展设计。
 
 ### 验收标准
 
 - 文档类问题能返回答案。
 - 答案能展示引用来源。
 - 检索结果包含文档标题、片段、score、metadata。
+- 能解释为什么相邻 chunk 扩展可以缓解“只召回半句话”的问题。
 
 ## 第 11 天：Hybrid Agent
 
@@ -521,12 +540,17 @@ START
 - 让 Agent 同时处理结构化和非结构化信息。
 - 实现 SQL + RAG 的结果融合。
 - 让项目难度明显高于普通 demo。
+- 明确 SQLAgent 和 RAGAgent 的职责边界，形成多角色协作雏形。
 
 ### 要做的事
 
 - 增加 `hybrid` 路由。
 - 对混合问题同时执行 SQL 和 RAG。
 - 实现 `merge_evidence` 节点。
+- 将 SQL 流程和 RAG 流程拆成两个子图或两个独立模块：
+  - `SQLAgent`：生成 SQL、校验 SQL、执行 SQL、失败修复。
+  - `RAGAgent`：检索文档、扩展上下文、生成带引用答案。
+- 在 `merge_evidence` 中记录两个 Agent 各自的输入、输出和置信度。
 - 最终答案同时包含：
   - 数据库查询结果
   - 文档引用证据
@@ -537,12 +561,14 @@ START
 
 - SQL + RAG 混合问答能力。
 - `hybrid_test_cases.md`。
+- SQLAgent / RAGAgent 职责说明和调用链路。
 
 ### 验收标准
 
 - 能回答既需要数据又需要规则的问题。
 - 前端能展示 SQL 结果和文档证据。
 - 能解释什么时候应该走 hybrid 分支。
+- 能解释 SQLAgent 和 RAGAgent 为什么要拆开，而不是让一个大 prompt 直接做完。
 
 ## 第 12 天：Memory 和 Checkpointer
 
@@ -551,6 +577,7 @@ START
 - 做出多轮会话和断点恢复能力。
 - 理解短期记忆、长期记忆、系统知识的区别。
 - 掌握 LangGraph checkpointer 的价值。
+- 借鉴多层记忆思路，但收敛成适合本项目的三层记忆：`recent_turns`、`conversation_summary`、`user_profile`。
 
 ### 要做的事
 
@@ -561,17 +588,29 @@ START
 - 支持刷新页面后继续对话。
 - 实现短期记忆：最近几轮消息。
 - 设计长期记忆接口，暂时可以先 mock。
+- 实现三层记忆结构：
+  - `recent_turns`：保留最近几轮完整对话，解决连续追问。
+  - `conversation_summary`：当历史变长时压缩成摘要，降低上下文长度。
+  - `user_profile`：记录用户角色和偏好，例如“运营同学更关注退款率和客服工单原因”。
+- 设计 `MemoryAgent` 节点：
+  - 对用户问题做指代补全，例如“那鞋靴类呢？”要继承上一轮时间范围和分析口径。
+  - 在回答结束后更新摘要和用户画像。
+- 准备 5 个多轮对话 case 测试记忆能力。
 
 ### 今日产出
 
 - 多会话持久化。
 - 断点恢复 demo。
+- 三层记忆数据结构。
+- `memory_test_cases.md`。
 
 ### 验收标准
 
 - 刷新页面后会话不丢。
 - 同一 `thread_id` 能继续上下文。
 - 能回答面试问题：Agent 跑到一半崩了怎么恢复。
+- 能回答面试问题：recent_turns、summary、user_profile 分别解决什么问题。
+- 能演示一次连续追问，例如“4 月服装类退款率”之后再问“那鞋靴类呢？”。
 
 ## 第 13 天：Observability 可观测性
 
@@ -580,6 +619,7 @@ START
 - 让 Agent 出问题时能定位。
 - 把执行链路可视化。
 - 记录成本、耗时、工具输入输出。
+- 让多角色节点的决策过程可解释：Router、SQL、RAG、Memory、Evaluator 都要能被 trace。
 
 ### 要做的事
 
@@ -596,19 +636,29 @@ START
   - `tool_output`
   - `success`
   - `latency_ms`
+- 记录角色级 trace：
+  - `agent_role`
+  - `decision_reason`
+  - `confidence`
+  - `retrieved_chunks`
+  - `generated_sql`
+  - `retry_count`
 - 前端新增 Trace 面板。
 - 前端展示执行步骤时间线。
+- Trace 面板按角色分组展示：Router 决策、SQLAgent 查询链路、RAGAgent 检索链路、MemoryAgent 更新内容、EvaluatorAgent 检查结果。
 
 ### 今日产出
 
 - 运行链路可视化。
 - 工具调用详情面板。
+- 角色级 Agent Trace 面板。
 
 ### 验收标准
 
 - 任意一次回答都能追踪每个节点。
 - 工具调用输入输出可查看。
 - 出错时能定位是哪一个节点或工具失败。
+- 能解释 trace 如何帮助分析 Agent 回答质量，而不只是打印日志。
 
 ## 第 14 天：Human-in-the-loop 审批
 
@@ -644,6 +694,7 @@ START
 - 从 demo 进入可评估项目。
 - 学会设计能判断对错的测试集。
 - 为简历准备量化指标。
+- 让评估集同时覆盖路由、SQL、RAG、Hybrid、记忆和追问。
 
 ### 要做的事
 
@@ -654,12 +705,16 @@ START
   - 混合推理题
   - 需要追问的问题
   - 故意包含歧义的问题
+  - 多轮记忆题
+  - 检索增强题
 - 每条包含：
   - `question`
   - `expected_route`
   - `expected_tools`
   - `expected_sql` 可选
   - `expected_answer_keywords`
+  - `expected_citations` 可选
+  - `conversation_context` 可选
   - `difficulty`
 - 定义评估指标。
 
@@ -667,12 +722,14 @@ START
 
 - `eval_dataset.jsonl`
 - `eval_metrics.md`
+- `golden_test_set.md`
 
 ### 验收标准
 
 - 至少 80 条测试样本。
 - 每条样本都能判断是否成功。
 - 指标定义清楚，不是只看主观感觉。
+- 能解释为什么 Agent 项目必须评估 route、tool、citation 和 answer，而不是只看答案像不像。
 
 ## 第 16 天：Eval Harness 自动评估
 
@@ -681,6 +738,7 @@ START
 - 自动跑评估，不靠手工点页面。
 - 记录结果并生成报告。
 - 形成面试时能讲的优化闭环。
+- 预留 Ragas / Custom Evaluator 接口，但第一版优先实现自定义评估。
 
 ### 要做的事
 
@@ -692,21 +750,29 @@ START
   - `task_success_rate`
   - `sql_execution_success_rate`
   - `tool_call_accuracy`
+  - `route_accuracy`
+  - `citation_hit_rate`
+  - `memory_followup_success_rate`
   - `avg_latency`
   - `avg_tool_calls`
   - `retry_success_rate`
 - 生成 `eval_report.md`。
+- 设计 evaluator 插件接口：
+  - 第一版使用规则和关键词判断。
+  - 后续可以接 Ragas 评估 faithfulness、context_precision、answer_relevancy。
 
 ### 今日产出
 
 - 自动评估脚本。
 - 第一版评估报告。
+- evaluator 接口草稿。
 
 ### 验收标准
 
 - 一条命令能跑完整评估。
 - 能得到 baseline 指标。
 - 评估结果保存为 JSON 和 Markdown。
+- 能解释为什么第一版先用 Custom Evaluator，而不是直接重度依赖 Ragas。
 
 ## 第 17 天：优化一轮并记录对比
 
@@ -715,6 +781,7 @@ START
 - 学会根据 bad case 做针对性优化。
 - 拿到优化前后对比数据。
 - 准备简历最有说服力的项目亮点。
+- 加入 1-2 个高级但可讲清楚的优化点，而不是堆满所有技术名词。
 
 ### 要做的事
 
@@ -722,6 +789,8 @@ START
 - 优化 SQL schema retrieval。
 - 优化工具描述。
 - 优化 RAG chunk size 和 top-k。
+- 实现 Query Rewrite / Multi Query：把用户问题扩展成 2-3 个检索查询，提高文档召回。
+- 优化相邻 chunk 扩展策略：对命中文档片段补充前后片段，并观察 citation 质量变化。
 - 给 SQL 生成加入 few-shot 示例。
 - 给错误修复节点补充失败原因。
 - 再跑一轮 eval。
@@ -732,12 +801,14 @@ START
 - `bad_cases.md`
 - `optimization_report.md`
 - baseline vs optimized 对比结果。
+- Multi Query / 相邻 chunk 扩展前后对比。
 
 ### 验收标准
 
 - 至少找到 5 类 bad case。
 - 至少完成 3 项针对性优化。
 - 指标有可解释的提升。
+- 能清楚说明每个优化点解决了哪类 bad case，而不是为了堆技术词。
 
 ## 第 18 天：工程化收尾
 
@@ -904,6 +975,9 @@ START
 - SQL Agent 子流程。
 - RAG Agent 子流程。
 - Hybrid 路由能力。
+- RouterAgent / SQLAgent / RAGAgent / MemoryAgent / EvaluatorAgent 的多角色节点设计，其中 MemoryAgent 和 EvaluatorAgent 可以是轻量实现。
+- recent_turns、conversation_summary、user_profile 三层记忆机制。
+- Query Rewrite / Multi Query 或相邻 chunk 扩展中的至少一个 RAG 优化点。
 - Checkpointer 会话恢复。
 - Trace 可视化。
 - Eval Harness 自动评估。
@@ -918,4 +992,14 @@ START
 ```text
 我不只是会调模型 API，也不只是会写前端页面。
 我能把 Agent 做成一个有状态、有工具、有评估、有日志、有恢复能力、能真实演示的工程化产品。
+```
+
+升级后的项目亮点可以概括为：
+
+```text
+我用 LangGraph 把电商售后分析拆成 RouterAgent、SQLAgent、RAGAgent、MemoryAgent 和 EvaluatorAgent 等多角色节点；
+用 Text2SQL 处理订单、商品、退款、评价、客服工单等结构化数据；
+用 RAG 检索退款政策、售后 SOP、指标口径等非结构化文档；
+用 recent_turns、conversation_summary、user_profile 支持连续追问；
+用 Trace Dashboard 和 Eval Harness 分析路由、工具调用、文档引用和答案质量。
 ```
