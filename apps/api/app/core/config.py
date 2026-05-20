@@ -10,7 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[4]
 class Settings(BaseSettings):
     app_env: str = "development"
     log_level: str = "INFO"
-    cors_origins: list[str] = ["http://localhost:3000"]
+    cors_origins: list[str] = ["http://localhost:3000", "http://localhost:3001"]
 
     siliconflow_api_key: str = ""
     llm_provider: str = "siliconflow"

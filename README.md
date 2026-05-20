@@ -1,121 +1,150 @@
 # 电商售后数据分析 Copilot
 
-这是一个面向面试展示的全栈 Agent MVP。项目不是泛聊天机器人，而是一个能处理电商售后业务问题的分析助手：用户用自然语言提问，系统自动路由到 SQL、RAG 或混合分析链路，并返回答案、SQL、文档证据、执行链路、记忆状态和基础评估指标。
+基于 **Next.js + FastAPI + LangGraph** 的企业数据分析 Agent，支持自然语言查询结构化数据库和非结构化知识库，能自动路由任务、调用工具、生成 SQL、执行校验、引用文档证据、失败反思修复，并提供执行链路、评估指标和运维观测面板。
 
-## 项目能做什么
+## 项目亮点
 
-- 自然语言查询结构化售后数据库，例如“4月服装类商品退款率是多少？”
-- 检索非结构化业务知识库，例如“退款率指标口径是什么？”
-- 对需要数据和文档证据的问题走 Hybrid 链路，例如“4月服装类商品退款率为什么升高？”
-- 展示 Router、SQLAgent、RAGAgent、MemoryAgent、EvaluatorAgent 的执行过程。
-- 提供 smoke test 和 eval endpoint，用于验证路由、回答和基本回归指标。
+- **LangGraph StateGraph** 编排多角色 Agent 工作流：RouterAgent、SQLAgent、RAGAgent、MemoryAgent、EvaluatorAgent
+- **SQL 分支**：schema retrieval → LLM 生成 SQL → 只读校验 → 执行 → 失败反思重试（最多 2 次）
+- **RAG 分支**：Chroma 向量检索 + 关键词检索双通路，带文档引用证据
+- **Hybrid 分支**：SQL + RAG 并行执行 → 证据融合 → 综合分析
+- **Checkpointer**：SqliteSaver 会话持久化，支持断点恢复
+- **三层记忆**：recent_turns / conversation_summary / user_profile
+- **Trace 可视化**：按 Agent 角色分组的执行链路面板
+- **Human-in-the-loop**：高风险 SQL 触发人工审批
+- **95 条评估集**：覆盖 SQL/RAG/Hybrid/Clarification/Memory/Ambiguous
+- **Docker Compose** 一键启动
 
-## 技术选型
+## 技术栈
 
-- 前端：Next.js、React、TypeScript
-- 后端：FastAPI、Pydantic
-- 数据库：SQLite 模拟电商售后结构化数据
-- 知识库：Markdown 文档 + 本地检索
-- Agent 能力：任务路由、SQL 工具、RAG 工具、会话记忆、Trace、Eval
+| 层 | 技术 |
+|---|---|
+| 前端 | Next.js / React / TypeScript / Tailwind CSS |
+| 后端 | FastAPI / Pydantic / LangGraph |
+| 数据库 | SQLite（5 表：products, orders, refunds, reviews, tickets） |
+| 向量库 | ChromaDB + SiliconFlow BGE-M3 Embedding |
+| LLM | SiliconFlow DeepSeek-V3 |
+| Agent | LangGraph StateGraph + Checkpointer + Tool Calling |
+| 工程化 | Docker Compose / pytest / 结构化日志 / Trace ID |
 
-当前版本优先完成可运行闭环。真实企业落地时，可以把本地规则路由替换为 LangGraph，把 Markdown 检索替换为 ChromaDB/FAISS + Embedding，把 SQLite 替换为 MySQL/PostgreSQL。
+## 快速开始
+
+### 1. 配置环境变量
+
+```bash
+cp apps/api/.env.example apps/api/.env
+# 编辑 apps/api/.env，填入 SILICONFLOW_API_KEY
+```
+
+### 2. Docker 一键启动（推荐）
+
+```bash
+docker-compose up -d
+```
+
+前端 http://localhost:3000 | 后端 http://localhost:8000 | API 文档 http://localhost:8000/docs
+
+### 3. 本地开发启动
+
+**后端：**
+```bash
+cd apps/api
+pip install -r requirements.txt
+python -m uvicorn app.main:app --reload --port 8000
+```
+
+**前端：**
+```bash
+cd apps/web
+npm install
+npm run dev -- --port 3000
+```
+
+### 4. 文档入库
+
+```bash
+# 预览 chunk 切分效果
+python scripts/ingest_documents.py --dry-run
+
+# 写入 Chroma 向量库
+python scripts/ingest_documents.py --reset
+```
 
 ## 目录结构
 
-```text
-apps/
-  api/                 FastAPI 后端
-    app/
-      api/             HTTP 路由
-      schemas/         请求和响应模型
-      services/        Agent、SQL、RAG、Memory、Trace、Eval
-  web/                 Next.js 前端控制台
-data/
-  documents/           模拟企业知识库 Markdown
-  demo.db              首次运行后自动生成的 SQLite 数据库
-docs/
-  task-complete-mvp.md 工程化需求对齐文档
-scripts/
-  smoke_test.py        端到端冒烟测试
+```
+├── apps/
+│   ├── api/                    FastAPI 后端
+│   │   ├── app/
+│   │   │   ├── api/            HTTP 路由（chat, eval）
+│   │   │   ├── core/           配置管理
+│   │   │   ├── schemas/        Pydantic 模型
+│   │   │   └── services/       Agent / SQL / RAG / Memory / Trace / Eval
+│   │   ├── tests/              后端单元测试（35 个）
+│   │   └── Dockerfile
+│   └── web/                    Next.js 前端
+│       ├── app/                页面与全局样式
+│       ├── components/         聊天气泡 / Trace 面板 / 类型定义
+│       └── Dockerfile
+├── data/
+│   ├── demo.db                 SQLite 模拟数据库（5 表 ~800 条数据）
+│   ├── documents/              10 篇业务知识库 Markdown
+│   ├── eval_dataset.jsonl      95 条评估用例
+│   └── vector_store/chroma/    Chroma 持久化向量库
+├── docs/                       设计文档
+├── scripts/                    数据入库 / 冒烟测试 / Demo 脚本
+├── docker-compose.yml
+└── README.md
 ```
 
-## 后端启动
+## Agent 工作流
 
-```powershell
-cd D:\yjs\front\agent\apps\api
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --port 8000
 ```
-
-访问：
-
-- Health check: http://127.0.0.1:8000/health
-- API docs: http://127.0.0.1:8000/docs
-
-## 前端启动
-
-```powershell
-cd D:\yjs\front\agent
-npm run dev:web
-```
-
-访问：
-
-- Web: http://localhost:3000
-
-如后端端口不是 8000，可以在 `apps/web/.env.local` 中配置：
-
-```text
-NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+START → classify_intent → route_condition
+  ├─ sql    → retrieve_schema → generate_sql → validate_sql
+  │         → execute_sql → [retry? → reflect → generate_sql] → format → END
+  ├─ rag    → retrieve_docs → format_rag_answer → END
+  ├─ hybrid → run_sql_and_rag → merge_evidence → END
+  └─ clarification → ask → END
 ```
 
 ## 验收方式
 
-后端冒烟测试：
-
-```powershell
-cd D:\yjs\front\agent
-.\apps\api\.venv\Scripts\python.exe -B scripts\smoke_test.py
+**后端单元测试：**
+```bash
+cd apps/api
+pytest tests/ -v
 ```
 
-前端构建：
-
-```powershell
-cd D:\yjs\front\agent
-npm run build:web
+**冒烟测试：**
+```bash
+python scripts/smoke_test.py
 ```
 
-接口评估：
-
-```powershell
+**评估运行：**
+```bash
 curl -X POST http://127.0.0.1:8000/api/eval/run
 ```
 
-## Chroma 文档入库
+## 评估指标
 
-真实 RAG 入库前，先复制 `apps/api/.env.example` 为 `apps/api/.env`，并填入 `SILICONFLOW_API_KEY`。
+| 指标 | 说明 |
+|---|---|
+| task_success_rate | 路由+关键词+工具全部通过率 |
+| route_accuracy | 路由判别准确率 |
+| keyword_accuracy | 答案关键词命中率 |
+| tool_call_accuracy | 工具调用匹配率 |
+| sql_execution_success_rate | SQL 执行成功率 |
+| citation_hit_rate | 文档引用命中率 |
+| avg_latency_ms | 平均延迟 |
+| retry_success_rate | SQL 修复重试成功率 |
 
-先查看 chunk 切分效果，不调用模型：
+## 面试讲解要点
 
-```powershell
-cd D:\yjs\front\agent
-.\apps\api\.venv\Scripts\python.exe scripts\ingest_documents.py --dry-run
-```
-
-确认切分效果后，写入 Chroma：
-
-```powershell
-.\apps\api\.venv\Scripts\python.exe scripts\ingest_documents.py --reset
-```
-
-切分策略说明见：
-
-```text
-docs/rag-chunking-and-chroma.md
-```
-
-## 已知限制
-
-- 当前是本地确定性 MVP，没有调用真实 LLM。
-- RAG 使用本地轻量检索，尚未接入 Embedding、向量数据库和 RRF。
-- 记忆系统保存在进程内，服务重启后会丢失。
-- 数据是模拟电商售后数据，适合展示工程闭环和面试讲解，不代表真实企业数据。
+- Function Calling 完整链路：Tool Schema → LLM tool_choice → 参数解析 → 本地执行 → result 回传
+- LangGraph StateGraph：State、Node、Conditional Edge、Checkpointer
+- SQL 安全：正则 + 语法双重只读校验，禁止 DROP/DELETE/UPDATE/INSERT/ALTER
+- RAG 设计：chunk strategy、embedding、向量检索、document citation、相邻 chunk 扩展
+- Memory 分层：recent_turns（连续追问）、conversation_summary（上下文压缩）、user_profile（偏好记忆）
+- Trace 可观测性：每个节点/工具的输入输出、耗时、错误、Agent 角色分组
+- Eval 闭环：95 条测试集 → 自动评估 → 指标报告 → bad case → 优化 → 再评估

@@ -8,6 +8,11 @@ class ChatRequest(BaseModel):
     session_id: str | None = None
 
 
+class ApprovalRequest(BaseModel):
+    session_id: str
+    approved: bool
+
+
 class Citation(BaseModel):
     doc_id: str
     title: str
@@ -33,11 +38,24 @@ class TraceStep(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class ApprovalContext(BaseModel):
+    reason: str
+    sql: str | None = None
+    risk_level: str = "low"
+
+
 class Metrics(BaseModel):
     latency_ms: float
     tool_calls: int
     citations: int
     route_confidence: float
+
+
+class MemoryInfo(BaseModel):
+    session_id: str
+    recent_turns: int
+    conversation_summary: str
+    user_profile: dict[str, str]
 
 
 class ChatResponse(BaseModel):
@@ -48,4 +66,6 @@ class ChatResponse(BaseModel):
     citations: list[Citation] = Field(default_factory=list)
     sql_result: SqlResult | None = None
     metrics: Metrics
-    memory: dict[str, Any] = Field(default_factory=dict)
+    memory: MemoryInfo
+    requires_approval: bool = False
+    approval_context: ApprovalContext | None = None
