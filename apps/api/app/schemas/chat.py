@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1)
     session_id: str | None = None
+    approved: bool = False  # HITL 审批标记：前端批准后重放请求时设为 True
 
 
 class ApprovalRequest(BaseModel):
@@ -19,6 +20,20 @@ class Citation(BaseModel):
     chunk_id: str
     snippet: str
     score: float
+
+    # ── 检索溯源 ──
+    retrieval_sources: list[str] = Field(default_factory=list)   # ["dense","bm25"]
+    dense_rank: int | None = None                                 # 在 dense 结果中的排名
+    sparse_rank: int | None = None                                # 在 bm25 结果中的排名
+    rrf_score: float | None = None                                # RRF 融合分
+    rerank_score: float | None = None                             # LLM Rerank 分(1-10)
+    matched_queries: list[str] = Field(default_factory=list)      # 命中哪些 MQE 变体
+
+    # ── 上下文扩展 ──
+    is_neighbor: bool = False                                     # 是否为相邻 chunk
+    source_hit: str | None = None                                 # 指向主命中的 chunk_id
+    rag_profile: str | None = None                                # RAG Router 选择的检索链路
+    router_reason: str | None = None                              # Router 选择原因
 
 
 class SqlResult(BaseModel):

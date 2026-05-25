@@ -32,6 +32,18 @@ class Settings(BaseSettings):
     chunk_overlap: int = 120
     top_k: int = 5
 
+    rag_enable_mqe: bool = True
+    rag_enable_bm25: bool = True
+    rag_enable_rrf: bool = True
+    rag_enable_rerank: bool = True
+    rag_enable_adjacent_context: bool = True
+    rag_enable_router: bool = True
+    rag_router_mode: str = "rule"
+    rag_router_confidence_threshold: float = 0.65
+    agent_router_mode: str = "hybrid"
+    agent_router_confidence_threshold: float = 0.88
+    agent_enable_answer_guard: bool = True
+
     model_config = SettingsConfigDict(
         env_file=API_DIR / ".env",
         env_file_encoding="utf-8",

@@ -161,7 +161,7 @@ export default function HomePage() {
       setCurrentSessionId(sessionId);
     }
 
-    setMessage(content);
+    setMessage(""); // 请求发送前清空输入框
     setIsLoading(true);
     setError("");
 
@@ -175,7 +175,7 @@ export default function HomePage() {
           ...s,
           title: isFirstMessage
             ? content.slice(0, 30) +
-              (content.length > 30 ? "..." : "")
+            (content.length > 30 ? "..." : "")
             : s.title,
           messages: [...s.messages, userMessage],
         };
@@ -230,26 +230,47 @@ export default function HomePage() {
     const sessionId = currentSessionId;
     if (!sessionId) return;
 
+    // 找到最近一条用户消息，作为重放的问题
+    const lastUserMsg = [...messages].reverse().find(
+      (m) => m.role === "user",
+    );
+    if (!lastUserMsg && !approved) {
+      setError("无法找到待审批的原始问题");
+      return;
+    }
+
+    if (!approved) {
+      // 拒绝：直接追加一条系统消息
+      const rejectMsg: Message = {
+        role: "assistant",
+        content: "SQL 执行已被用户拒绝，Agent 终止当前操作。",
+      };
+      setSessions((prev) =>
+        prev.map((s) => {
+          if (s.id !== sessionId) return s;
+          return { ...s, messages: [...s.messages, rejectMsg] };
+        }),
+      );
+      return;
+    }
+
+    // 批准：用 approved=true 重新发送原问题
     setIsLoading(true);
     setError("");
 
     try {
-      const response = await fetch(
-        `${apiBaseUrl}/api/chat/approve`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            session_id: sessionId,
-            approved,
-          }),
-        },
-      );
+      const response = await fetch(`${apiBaseUrl}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: lastUserMsg!.content,
+          session_id: sessionId,
+          approved: true,
+        }),
+      });
 
       if (!response.ok) {
-        throw new Error(
-          `Approval API returned ${response.status}`,
-        );
+        throw new Error(`API returned ${response.status}`);
       }
 
       const data = (await response.json()) as ChatResponse;
@@ -431,7 +452,7 @@ export default function HomePage() {
                   />
                 ))}
                 {isLoading &&
-                messages[messages.length - 1]?.role ===
+                  messages[messages.length - 1]?.role ===
                   "user" ? (
                   <div className="chatBubble assistant loadingBubble">
                     <div className="bubbleContent assistantContent">

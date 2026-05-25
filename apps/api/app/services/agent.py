@@ -11,6 +11,7 @@ StateGraph 结构:
 SQL 分支含失败重试（reflect → generate 循环，默认最多 2 次）。
 """
 
+import json
 import logging
 import sqlite3
 from time import perf_counter
@@ -20,6 +21,7 @@ from uuid import uuid4
 import httpx
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
+from langgraph.types import Command, interrupt
 
 from app.core.config import settings
 from app.schemas.chat import (
@@ -41,6 +43,7 @@ from app.services.memory import (
 )
 from app.services.rag import retrieve_docs
 from app.services.sql_tools import (
+    analyze_sql_risk,
     build_sql_for_question,
     execute_readonly_sql,
     get_table_schema,
@@ -82,6 +85,8 @@ def _init_state(question: str, session_id: str, prompt_ctx: PromptContext | None
         "approval_reason": "",
         "approval_sql": "",
         "approval_risk": "low",
+        "sql_approved": False,  # HITL 审批标记
+        "sql_risk": None,
         "is_finished": False,
     }
 
@@ -264,6 +269,15 @@ def _generate_sql(
 def route_question(question: str) -> tuple[str, str, float]:
     text = question.lower()
     weak = ["随便", "不知道", "都行", "看看"]
+    policy_action_terms = [
+        "应该", "应当", "需要", "触发", "进入", "走什么", "什么流程",
+        "怎么处理", "如何处理", "如何判断", "怎么判断", "流程", "规则",
+        "sop", "处置", "升级", "人工审核", "品控", "质量控制",
+    ]
+    metric_query_terms = [
+        "多少", "几", "统计", "查询", "退款率", "订单数", "退款数", "工单数",
+        "金额", "最高", "排行", "排名", "top", "对比", "环比", "同比",
+    ]
     data_terms = [
         "4月", "5月", "3月", "订单", "商品", "工单", "评价",
         "最高", "多少", "对比", "升高", "下降", "退款率", "销量",
@@ -277,9 +291,21 @@ def route_question(question: str) -> tuple[str, str, float]:
 
     has_data = any(kw in text for kw in data_terms)
     has_doc = any(kw in text for kw in doc_terms)
+    has_policy_action = any(kw in text for kw in policy_action_terms)
+    has_metric_query = any(kw in text for kw in metric_query_terms)
+    has_definition_intent = any(kw in text for kw in ["口径", "定义", "规则", "流程", "SOP", "sop"])
+    has_time_or_stat_intent = any(
+        kw in text for kw in ["3月", "4月", "5月", "2026-", "统计", "查询", "多少", "对比", "环比", "同比"]
+    )
 
     if len(question.strip()) < 4 or any(kw in text for kw in weak):
         return ROUTE_CLARIFY, "问题信息不足，需要先追问分析范围。", 0.72
+
+    if has_policy_action and not has_metric_query:
+        return ROUTE_RAG, "问题是在询问业务规则、SOP 或触发流程，优先检索知识库文档。", 0.9
+
+    if has_definition_intent and not has_time_or_stat_intent:
+        return ROUTE_RAG, "问题是在询问指标口径、定义、规则或流程，优先检索知识库文档。", 0.9
 
     if has_data and has_doc:
         return ROUTE_HYBRID, "问题同时需要结构化数据和文档证据。", 0.91
@@ -293,8 +319,211 @@ def route_question(question: str) -> tuple[str, str, float]:
     return ROUTE_CLARIFY, "暂未识别出明确的数据查询或知识检索意图，需追问。", 0.65
 
 
+def _extract_json_object(text: str) -> dict[str, Any]:
+    cleaned = text.strip()
+    if "```" in cleaned:
+        parts = cleaned.split("```")
+        cleaned = next((part for part in parts if "{" in part and "}" in part), cleaned)
+        cleaned = cleaned.replace("json", "", 1).strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start < 0 or end < start:
+        raise ValueError("LLM did not return a JSON object")
+    payload = json.loads(cleaned[start : end + 1])
+    if not isinstance(payload, dict):
+        raise ValueError("LLM router JSON must be an object")
+    return payload
+
+
+def _should_use_llm_router(question: str, rule_route: str, rule_confidence: float) -> bool:
+    mode = settings.agent_router_mode.lower()
+    if mode == "rule" or not settings.siliconflow_api_key:
+        return False
+    if mode == "llm":
+        return True
+    review_terms = [
+        "应该", "触发", "流程", "规则", "SOP", "sop", "SKU", "sku",
+        "为什么", "原因", "结合", "判断", "处理", "升级", "质量争议",
+    ]
+    return rule_confidence < settings.agent_router_confidence_threshold or any(
+        term in question for term in review_terms
+    )
+
+
+def _classify_question_with_llm(
+    question: str,
+    rule_route: str,
+    rule_reason: str,
+    rule_confidence: float,
+) -> tuple[str, str, float]:
+    prompt = f"""你是企业售后 Agent 的意图路由器，只负责选择工具链，不直接回答用户。
+
+可选 route：
+- sql：需要查询结构化数据库，例如退款率、订单数、退款数、排行榜、具体统计。
+- rag：需要查询知识库文档，例如政策、SOP、规则、流程、口径定义、应该触发什么处理。
+- hybrid：需要同时查数据库和知识库，例如“结合4月数据和退款政策分析为什么升高”。
+- clarification：问题缺少关键条件，需要先追问。
+
+判断要求：
+- “应该/触发/流程/规则/怎么处理/如何判断/SOP”通常是 rag，除非用户明确要查真实数据。
+- “多少/退款率/订单数/退款数/排名/top/统计/查询”通常是 sql。
+- “结合数据和政策/为什么升高/归因分析”通常是 hybrid。
+- 只能输出 JSON，不要输出解释文字。
+
+规则路由初判：
+route={rule_route}
+reason={rule_reason}
+confidence={rule_confidence}
+
+用户问题：
+{question}
+
+输出格式：
+{{"route":"sql|rag|hybrid|clarification","confidence":0.0,"reason":"一句中文原因"}}"""
+
+    headers = {
+        "Authorization": f"Bearer {settings.siliconflow_api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": settings.llm_model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+        "max_tokens": 240,
+        "response_format": {"type": "json_object"},
+    }
+    with httpx.Client() as client:
+        resp = client.post(
+            f"{settings.llm_base_url.rstrip('/')}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=20.0,
+        )
+        resp.raise_for_status()
+        data = _extract_json_object(resp.json()["choices"][0]["message"]["content"])
+
+    route = str(data.get("route", "")).lower()
+    if route not in {ROUTE_SQL, ROUTE_RAG, ROUTE_HYBRID, ROUTE_CLARIFY}:
+        raise ValueError(f"Unsupported route from LLM router: {route}")
+    confidence = float(data.get("confidence", 0.75))
+    confidence = max(0.0, min(1.0, confidence))
+    reason = str(data.get("reason") or "LLM Router 完成意图分类。")
+    return route, f"LLM Router：{reason}", confidence
+
+
+def _classify_question(question: str) -> tuple[str, str, float]:
+    rule_route, rule_reason, rule_confidence = route_question(question)
+    if not _should_use_llm_router(question, rule_route, rule_confidence):
+        return rule_route, rule_reason, rule_confidence
+    try:
+        return _classify_question_with_llm(question, rule_route, rule_reason, rule_confidence)
+    except Exception as exc:
+        logger.warning("LLM Router failed (%s), using rule route", exc)
+        return rule_route, f"{rule_reason}（LLM Router 失败，已回退规则路由）", rule_confidence
+
+
+def _is_policy_or_flow_question(question: str) -> bool:
+    policy_terms = [
+        "应该", "应当", "触发", "进入", "什么流程", "怎么处理", "如何处理",
+        "如何判断", "规则", "SOP", "sop", "处置", "升级", "质量控制",
+    ]
+    metric_terms = ["多少", "统计", "查询", "退款率", "订单数", "退款数", "金额", "排名", "top"]
+    return any(term in question for term in policy_terms) and not any(
+        term in question for term in metric_terms
+    )
+
+
+def _citation_dict(citation: Any) -> dict[str, Any]:
+    return {
+        "doc_id": citation.doc_id,
+        "title": citation.title,
+        "chunk_id": citation.chunk_id,
+        "snippet": citation.snippet,
+        "score": citation.score,
+        "retrieval_sources": citation.retrieval_sources,
+        "dense_rank": citation.dense_rank,
+        "sparse_rank": citation.sparse_rank,
+        "rrf_score": citation.rrf_score,
+        "rerank_score": citation.rerank_score,
+        "matched_queries": citation.matched_queries,
+        "is_neighbor": citation.is_neighbor,
+        "source_hit": citation.source_hit,
+        "rag_profile": citation.rag_profile,
+        "router_reason": citation.router_reason,
+    }
+
+
+def _format_rag_answer_from_citations(citations: list[dict[str, Any]]) -> str:
+    if not citations:
+        return "知识库中没有检索到足够相关的政策或 SOP。"
+    titles = "、".join(dict.fromkeys(c["title"] for c in citations))
+    snippets = "；".join(c["snippet"] for c in citations[:3])
+    return f"根据知识库中的 {titles}，相关依据包括：{snippets}"
+
+
+def _answer_guard_and_repair(
+    question: str,
+    result: dict[str, Any],
+    trace: TraceRecorder,
+) -> dict[str, Any]:
+    if not settings.agent_enable_answer_guard:
+        return result
+
+    expected_route, expected_reason, expected_confidence = route_question(question)
+    sql_columns = set(result.get("sql_columns", []))
+    sql_looks_like_top_refund = "refund_count" in sql_columns and "refund_rate" not in sql_columns
+    should_be_docs = (
+        expected_route == ROUTE_RAG
+        or _is_policy_or_flow_question(question)
+        or (result.get("route") == ROUTE_SQL and sql_looks_like_top_refund and "流程" in question)
+    )
+
+    if result.get("route") == ROUTE_SQL and should_be_docs:
+        citations = [_citation_dict(c) for c in retrieve_docs(question)]
+        repaired = _update(
+            result,
+            route=ROUTE_RAG,
+            route_reason=f"Answer Guard 回退：{expected_reason}",
+            route_confidence=max(expected_confidence, 0.82),
+            citations_data=citations,
+            answer_text=_format_rag_answer_from_citations(citations),
+            sql="",
+            sql_columns=[],
+            sql_rows=[],
+            sql_row_count=0,
+            sql_error=None,
+        )
+        trace.add(
+            "answer_guard",
+            "EvaluatorAgent",
+            "warning",
+            "检测到 SQL 结果与用户流程/规则意图不匹配，已回退到 RAG 知识库检索。",
+            metadata={
+                "original_route": result.get("route"),
+                "repaired_route": ROUTE_RAG,
+                "expected_route": expected_route,
+                "sql_columns": list(sql_columns),
+            },
+        )
+        return repaired
+
+    trace.add(
+        "answer_guard",
+        "EvaluatorAgent",
+        "success",
+        "答案链路与用户问题意图匹配。",
+        metadata={
+            "route": result.get("route"),
+            "expected_route": expected_route,
+            "expected_confidence": expected_confidence,
+        },
+    )
+    return result
+
+
 # ── Helper ───────────────────────────────────────────────────────────
 
+# 数据的不可变性对于 StateGraph 来说非常重要，因为它依赖于状态的纯函数转换和条件分支。这个 _update 函数确保我们每次都返回一个新的状态副本，而不是修改原有状态，从而避免了潜在的副作用和难以追踪的状态变更。
 def _update(state: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
     """返回合并后的完整 state 副本。LangGraph 的 dict state 会替换而非合并。"""
     merged = dict(state)
@@ -302,11 +531,17 @@ def _update(state: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
     return merged
 
 
+def _stringify_user_profile(profile: dict[str, Any]) -> dict[str, str]:
+    return {str(key): "" if value is None else str(value) for key, value in profile.items()}
+
+
 # ── Nodes ────────────────────────────────────────────────────────────
 
 
 def classify_intent_node(state: dict[str, Any]) -> dict[str, Any]:
-    route, reason, confidence = route_question(state["question"])
+    if state.get("route"):
+        return state
+    route, reason, confidence = _classify_question(state["question"])
     return _update(state, route=route, route_reason=reason, route_confidence=confidence)
 
 
@@ -348,6 +583,52 @@ def sql_validate_node(state: dict[str, Any]) -> dict[str, Any]:
         return _update(state)
     except ValueError as exc:
         return _update(state, sql_error=str(exc))
+
+
+def sql_risk_check_node(state: dict[str, Any]) -> dict[str, Any]:
+    """
+    SQL 执行前风险分析——真正 HITL（LangGraph interrupt）。
+
+    - blocked  → 拒绝执行，记录错误
+    - dangerous → interrupt() 挂起图，等待用户审批后再继续
+    - warning │ safe → 直接放行
+
+    这是「图暂停」而非「条件路由」——
+    图状态在 checkpointer 中完整保留，恢复后从 interrupt 下一行继续执行。
+    """
+    if state.get("sql_approved"):
+        return _update(state, sql_risk="approved")
+
+    sql = state.get("sql", "")
+    risk = analyze_sql_risk(sql)
+
+    if risk["level"] == "blocked":
+        return _update(state, sql_error=f"SQL 被拒绝：{risk['reason']}", sql_risk=risk)
+
+    if risk["level"] == "dangerous":
+        # ── 真正挂起：图在这里暂停 ──
+        decision = interrupt({
+            "type": "sql_approval",
+            "reason": risk["reason"],
+            "sql": sql,
+            "risk": risk["risk"],
+        })
+        # ── 恢复后从这里继续执行 ──
+        if decision.get("approved"):
+            return _update(state, sql_risk=risk)
+        else:
+            return _update(state, sql_error="用户拒绝执行此 SQL")
+
+    return _update(state, sql_risk=risk)
+
+
+def risk_check_condition(
+    state: dict[str, Any],
+) -> Literal["execute", "format"]:
+    """风险检查后的路由（只有两条路：执行或报错）。"""
+    if state.get("sql_error"):
+        return "format"
+    return "execute"
 
 
 def sql_execute_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -427,6 +708,16 @@ def rag_retrieve_node(state: dict[str, Any]) -> dict[str, Any]:
             "chunk_id": c.chunk_id,
             "snippet": c.snippet,
             "score": c.score,
+            "retrieval_sources": c.retrieval_sources,
+            "dense_rank": c.dense_rank,
+            "sparse_rank": c.sparse_rank,
+            "rrf_score": c.rrf_score,
+            "rerank_score": c.rerank_score,
+            "matched_queries": c.matched_queries,
+            "is_neighbor": c.is_neighbor,
+            "source_hit": c.source_hit,
+            "rag_profile": c.rag_profile,
+            "router_reason": c.router_reason,
         }
         for c in citations
     ]
@@ -477,13 +768,121 @@ def hybrid_run_node(state: dict[str, Any]) -> dict[str, Any]:
             "chunk_id": c.chunk_id,
             "snippet": c.snippet,
             "score": c.score,
+            "retrieval_sources": c.retrieval_sources,
+            "dense_rank": c.dense_rank,
+            "sparse_rank": c.sparse_rank,
+            "rrf_score": c.rrf_score,
+            "rerank_score": c.rerank_score,
+            "matched_queries": c.matched_queries,
+            "is_neighbor": c.is_neighbor,
+            "source_hit": c.source_hit,
+            "rag_profile": c.rag_profile,
+            "router_reason": c.router_reason,
         }
         for c in citations
     ]
     return _update(state, **updates)
 
 
+def _build_hybrid_evidence(state: dict[str, Any]) -> tuple[list[str], str, str]:
+    parts: list[str] = []
+
+    error = state.get("sql_error")
+    rows = state.get("sql_rows", [])
+    if error:
+        parts.append(f"数据查询遇到问题：{error}")
+    elif rows:
+        row = rows[0]
+        if "refund_rate" in row:
+            parts.append(
+                f"数据结果：{row.get('month', '')} {row.get('category', '')}类目 "
+                f"退款率为 {row['refund_rate']}%（订单 {row.get('order_count', '?')} 单，"
+                f"退款 {row.get('refund_count', '?')} 单）。"
+            )
+        elif "ticket_count" in row:
+            detail = "，".join(
+                f"{item.get('reason', '?')} {item['ticket_count']} 次"
+                for item in rows
+            )
+            parts.append(f"数据结果：工单原因分布——{detail}。")
+        else:
+            parts.append(f"数据结果：查询返回 {state.get('sql_row_count', 0)} 行。")
+    else:
+        parts.append("数据结果：未查到匹配记录。")
+
+    citations = state.get("citations_data", [])
+    if citations:
+        titles = "、".join(dict.fromkeys(c["title"] for c in citations))
+        snippets = "；".join(c["snippet"] for c in citations[:3])
+        parts.append(f"文档依据（{titles}）：{snippets}")
+
+    sql_evidence = json.dumps(
+        {
+            "sql": state.get("sql", ""),
+            "columns": state.get("sql_columns", []),
+            "rows": rows[:8],
+            "row_count": state.get("sql_row_count", 0),
+            "error": error,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    doc_evidence = json.dumps(citations[:5], ensure_ascii=False, indent=2)
+    return parts, sql_evidence, doc_evidence
+
+
+def _generate_hybrid_answer_with_llm(state: dict[str, Any], sql_evidence: str, doc_evidence: str) -> str:
+    if not settings.siliconflow_api_key:
+        raise RuntimeError("SILICONFLOW_API_KEY not configured")
+
+    prompt = f"""你是企业售后数据分析 Agent。请基于用户问题、SQL 查询结果和知识库文档证据，生成中文综合分析。
+
+要求：
+- 只能使用给定的 SQL 结果和文档证据，不要编造额外数据。
+- 如果 SQL 结果没有退款原因分布、SKU 分布、活动渠道等信息，必须明确说明“当前数据不足，不能直接断定具体原因”。
+- 回答要包含：数据异常判断、可能原因、文档依据、还缺少哪些数据、下一步建议。
+- 不要输出 JSON，不要输出 Markdown 表格。
+
+用户问题：
+{state.get("question", "")}
+
+SQL 结果：
+{sql_evidence}
+
+文档证据：
+{doc_evidence}
+"""
+
+    headers = {
+        "Authorization": f"Bearer {settings.siliconflow_api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": settings.llm_model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "max_tokens": 900,
+    }
+
+    with httpx.Client() as client:
+        resp = client.post(
+            f"{settings.llm_base_url.rstrip('/')}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=45.0,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+
+
 def hybrid_merge_node(state: dict[str, Any]) -> dict[str, Any]:
+    evidence_parts, sql_evidence, doc_evidence = _build_hybrid_evidence(state)
+    try:
+        answer = _generate_hybrid_answer_with_llm(state, sql_evidence, doc_evidence)
+        return _update(state, answer_text=answer)
+    except Exception as exc:
+        logger.warning("Hybrid answer synthesis failed (%s), using template fallback", exc)
+
     parts: list[str] = []
 
     error = state.get("sql_error")
@@ -563,18 +962,23 @@ def build_graph() -> StateGraph:
         return _graph
 
     workflow = StateGraph(dict)
-
-    workflow.add_node("classify_intent", classify_intent_node)
+    # 意图识别
+    workflow.add_node("classify_intent", classify_intent_node) 
+    # 获取表结构
     workflow.add_node("sql_retrieve_schema", sql_retrieve_schema_node)
     workflow.add_node("sql_generate", sql_generate_node)
     workflow.add_node("sql_validate", sql_validate_node)
+    # 风险检查、触发 HITL 挂起（真正 interrupt）
+    workflow.add_node("sql_risk_check", sql_risk_check_node)
     workflow.add_node("sql_execute", sql_execute_node)
     workflow.add_node("sql_reflect", sql_reflect_node)
     workflow.add_node("format_sql_answer", format_sql_answer_node)
+    # RAG分支
     workflow.add_node("rag_retrieve", rag_retrieve_node)
     workflow.add_node("format_rag_answer", format_rag_answer_node)
     workflow.add_node("hybrid_run", hybrid_run_node)
     workflow.add_node("hybrid_merge", hybrid_merge_node)
+    # 当 classify_intent 判断问题信息不足时，生成追问提示
     workflow.add_node("clarification", clarification_node)
     workflow.add_node("generate_final", generate_final_node)
 
@@ -594,7 +998,15 @@ def build_graph() -> StateGraph:
     # SQL branch
     workflow.add_edge("sql_retrieve_schema", "sql_generate")
     workflow.add_edge("sql_generate", "sql_validate")
-    workflow.add_edge("sql_validate", "sql_execute")
+    workflow.add_edge("sql_validate", "sql_risk_check")
+    workflow.add_conditional_edges(
+        "sql_risk_check",
+        risk_check_condition,
+        {
+            "execute": "sql_execute",
+            "format": "format_sql_answer",
+        },
+    )
     workflow.add_conditional_edges(
         "sql_execute",
         sql_check_condition,
@@ -624,6 +1036,57 @@ def build_graph() -> StateGraph:
 # ── Public API ───────────────────────────────────────────────────────
 
 
+def _build_approval_response(
+    result: dict[str, Any],
+    interrupt_info: dict[str, Any],
+    trace: TraceRecorder,
+    started: float,
+    memory: Any,
+) -> ChatResponse:
+    """图被 interrupt() 挂起时，构建审批请求响应返回前端。"""
+    trace.add(
+        "hitl_interrupted",
+        "EvaluatorAgent",
+        "success",
+        "图已挂起，等待用户审批。",
+        metadata={"interrupt": interrupt_info},
+    )
+    trace.add(
+        "final_answer",
+        "EvaluatorAgent",
+        "success",
+        "审批挂起中，返回审批请求。",
+    )
+
+    latency_ms = round((perf_counter() - started) * 1000, 2)
+    return ChatResponse(
+        answer=f"SQL 需要审批后才能执行。\n\n原因：{interrupt_info.get('reason', '需要人工审批')}\n\n待审批 SQL：\n{interrupt_info.get('sql', '')}\n\n请在前端点击「批准」或「拒绝」。",
+        route=result.get("route", "sql"),
+        trace_id=trace.trace_id,
+        steps=trace.steps,
+        citations=[],
+        sql_result=None,
+        metrics=Metrics(
+            latency_ms=latency_ms,
+            tool_calls=trace.tool_calls,
+            citations=0,
+            route_confidence=result.get("route_confidence", 0),
+        ),
+        memory=MemoryInfo(
+            session_id=result.get("session_id", ""),
+            recent_turns=len(memory.recent_turns),
+            conversation_summary=memory.conversation_summary,
+            user_profile=_stringify_user_profile(memory.user_profile),
+        ),
+        requires_approval=True,
+        approval_context=ApprovalContext(
+            reason=interrupt_info.get("reason", "需要人工审批"),
+            sql=interrupt_info.get("sql"),
+            risk_level=interrupt_info.get("risk", "dangerous"),
+        ),
+    )
+
+
 def run_agent(request: ChatRequest) -> ChatResponse:
     started = perf_counter()
     session_id = request.session_id or f"session_{uuid4().hex[:8]}"
@@ -639,7 +1102,7 @@ def run_agent(request: ChatRequest) -> ChatResponse:
         metadata={"session_id": session_id, "resolved_question": question},
     )
 
-    route, reason, confidence = route_question(question)
+    route, reason, confidence = _classify_question(question)
     trace.add(
         "classify_intent",
         "RouterAgent",
@@ -651,11 +1114,49 @@ def run_agent(request: ChatRequest) -> ChatResponse:
     graph = build_graph()
     config = {"configurable": {"thread_id": session_id}}
 
-    # 构建结构化 PromptContext（6 层结构），注入 graph state 供 LLM 节点使用
+    # 构建结构化 PromptContext
     prompt_ctx = build_context(memory)
 
-    initial = _init_state(question, session_id, prompt_ctx)
-    result = graph.invoke(initial, config)
+    # ═══════════════════════════════════════
+    # 真正 HITL：区分首次 invoke 和恢复 invoke
+    # ═══════════════════════════════════════
+    if request.approved:
+        # 恢复被 interrupt() 挂起的图
+        trace.add(
+            "approval_received",
+            "EvaluatorAgent",
+            "success",
+            "用户已批准 SQL 执行，恢复挂起的 Graph。",
+        )
+        result = graph.invoke(Command(resume={"approved": True}), config)
+        # 如果 thread 没有挂起过，resume 可能返回 None
+        if result is None:
+            initial = _init_state(question, session_id, prompt_ctx)
+            initial["route"] = route
+            initial["route_reason"] = reason
+            initial["route_confidence"] = confidence
+            initial["sql_approved"] = True
+            result = graph.invoke(initial, config)
+    else:
+        initial = _init_state(question, session_id, prompt_ctx)
+        initial["route"] = route
+        initial["route_reason"] = reason
+        initial["route_confidence"] = confidence
+        result = graph.invoke(initial, config)
+
+    # 检查图是否被 interrupt() 挂起
+    interrupt_info = result.get("__interrupt__") if result else None
+    if interrupt_info:
+        # 图挂起了 → 返回审批请求给前端
+        return _build_approval_response(
+            result=result,
+            interrupt_info=interrupt_info[0] if isinstance(interrupt_info, list) else interrupt_info,
+            trace=trace,
+            started=started,
+            memory=memory,
+        )
+
+    result = _answer_guard_and_repair(question, result, trace)
 
     trace.add(
         "route_task",
@@ -759,26 +1260,8 @@ def run_agent(request: ChatRequest) -> ChatResponse:
 
     latency_ms = round((perf_counter() - started) * 1000, 2)
 
-    requires_approval = False
-    approval_context = None
-    sql_raw = result.get("sql", "")
-    if sql_raw and result["route"] in (ROUTE_SQL, ROUTE_HYBRID):
-        high_risk_keywords = ["password", "secret", "token", "credit_card"]
-        if any(kw in sql_raw.lower() for kw in high_risk_keywords):
-            requires_approval = True
-            approval_context = ApprovalContext(
-                reason="SQL 涉及敏感字段，需要人工审批后执行。",
-                sql=sql_raw,
-                risk_level="high",
-            )
-        elif result.get("sql_row_count", 0) > 500:
-            requires_approval = True
-            approval_context = ApprovalContext(
-                reason=f"SQL 返回 {result['sql_row_count']} 行数据，数量较大，需要确认。",
-                sql=sql_raw,
-                risk_level="medium",
-            )
-
+    # HITL：interrupt 机制在前面的 __interrupt__ 检查中已处理。
+    # 到达这里说明图正常完成（没有被挂起），不需要审批。
     return ChatResponse(
         answer=answer,
         route=result["route"],
@@ -796,8 +1279,8 @@ def run_agent(request: ChatRequest) -> ChatResponse:
             session_id=session_id,
             recent_turns=len(memory.recent_turns),
             conversation_summary=memory.conversation_summary,
-            user_profile=memory.user_profile,
+            user_profile=_stringify_user_profile(memory.user_profile),
         ),
-        requires_approval=requires_approval,
-        approval_context=approval_context,
+        requires_approval=False,
+        approval_context=None,
     )
