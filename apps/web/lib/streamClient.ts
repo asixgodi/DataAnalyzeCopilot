@@ -1,3 +1,5 @@
+import type { TraceStep } from "@/components/types";
+
 // SSE event types matching the backend
 export interface RouteEvent {
   route: string;
@@ -26,6 +28,8 @@ export interface MetricsEvent {
 export interface DoneEvent {
   trace_id: string;
   session_id: string;
+  status?: string;
+  span_count?: number;
 }
 
 export interface StreamCallbacks {
@@ -34,9 +38,9 @@ export interface StreamCallbacks {
   onSqlResult: (data: SqlResultEvent) => void;
   onRetrieval: (data: RetrievalEvent) => void;
   onAnswerDelta: (delta: string) => void;
-  onTrace: (step: any) => void;
+  onTrace: (step: TraceStep) => void;
   onMetrics: (data: MetricsEvent) => void;
-  onDone: (data: DoneEvent) => void;
+  onDone: (data: DoneEvent) => void | Promise<void>;
   onError: (error: string) => void;
   onStart?: () => void;
 }
@@ -121,7 +125,7 @@ export async function streamChat(
             callbacks.onMetrics(parsed.data);
             break;
           case "done":
-            callbacks.onDone(parsed.data);
+            await callbacks.onDone(parsed.data);
             break;
           case "error":
             callbacks.onError(parsed.data.message || "Unknown error");

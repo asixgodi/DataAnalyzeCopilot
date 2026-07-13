@@ -5,6 +5,13 @@ export type TraceStep = {
   detail: string;
   latency_ms: number;
   metadata: Record<string, unknown>;
+  trace_id?: string;
+  span_id?: string;
+  parent_span_id?: string | null;
+  sequence?: number;
+  kind?: string;
+  started_at?: string;
+  ended_at?: string;
 };
 
 export type Citation = {
@@ -13,6 +20,44 @@ export type Citation = {
   chunk_id: string;
   snippet: string;
   score: number;
+  retrieval_sources?: string[];
+  dense_rank?: number | null;
+  sparse_rank?: number | null;
+  rrf_score?: number | null;
+  rerank_score?: number | null;
+  matched_queries?: string[];
+  is_neighbor?: boolean;
+  source_hit?: string | null;
+  rag_profile?: string | null;
+  router_reason?: string | null;
+};
+
+export type TraceRun = {
+  trace_id: string;
+  session_id: string;
+  route: string;
+  route_confidence: number;
+  status: string;
+  started_at: string;
+  ended_at: string | null;
+  duration_ms: number;
+  tool_calls: number;
+  citation_count: number;
+};
+
+export type TraceRetrieval = Citation & {
+  id: number | null;
+  trace_id: string;
+  span_id: string;
+  final_rank: number | null;
+  selected_for_context: boolean;
+};
+
+export type TraceDetail = {
+  run: TraceRun;
+  spans: TraceStep[];
+  retrievals: TraceRetrieval[];
+  metadata: Record<string, unknown>;
 };
 
 export type SqlResult = {

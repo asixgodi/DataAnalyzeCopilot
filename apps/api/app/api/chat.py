@@ -87,7 +87,10 @@ async def _stream_agent_events(request: ChatRequest):
     """异步生成器 — 逐步执行 Agent 流水线并逐条推送 SSE 事件。"""
     started = perf_counter()
     session_id = request.session_id or f"session_{uuid4().hex[:8]}"
-    trace = TraceRecorder()
+    trace = TraceRecorder(
+        session_id=session_id,
+        question_summary=request.message,
+    )
 
     # ── 1. Load memory 
     memory = get_memory(session_id)
@@ -97,6 +100,15 @@ async def _stream_agent_events(request: ChatRequest):
     guard_result = input_guard.check(request.message)
     if not guard_result.passed:
         slog.warning("input_guard_rejected", session_id=session_id, reason=guard_result.reason)
+        guard_step = trace.add(
+            "input_guard",
+            "ChatAgent",
+            "error",
+            guard_result.reason or "输入安全检查未通过。",
+            kind="guard",
+        )
+        trace.finish_run(status="error", route="clarification")
+        yield _sse_event("trace", guard_step.model_dump())
         yield _sse_event("error", {
             "message": guard_result.reason or "抱歉，您的输入包含不合规内容，请重新描述您的问题。",
         })
@@ -108,26 +120,28 @@ async def _stream_agent_events(request: ChatRequest):
     question = resolve_followup(request_message.strip(), memory)
 
     slog.set_trace(trace.trace_id)
-    trace.add(
+    receive_step = trace.add(
         "receive_message",
         "ChatAgent",
         "success",
         "收到用户问题并加载会话记忆。",
         metadata={"session_id": session_id, "resolved_question": question},
     )
+    yield _sse_event("trace", receive_step.model_dump())
 
     # ── 3. Classify question & yield "route" event ───────────────────
     prompt_ctx = build_context(memory)
     recent_turns = prompt_ctx.get("recent_turns", [])
     route, reason, confidence = _classify_question(question, recent_turns=recent_turns)
 
-    trace.add(
+    classify_step = trace.add(
         "classify_intent",
         "RouterAgent",
         "success",
         reason,
         metadata={"route": route, "confidence": confidence},
     )
+    yield _sse_event("trace", classify_step.model_dump())
 
     yield _sse_event("route", {
         "route": route,
@@ -140,12 +154,13 @@ async def _stream_agent_events(request: ChatRequest):
     config = {"configurable": {"thread_id": session_id}}
 
     if request.approved:
-        trace.add(
+        approval_step = trace.add(
             "approval_received",
             "EvaluatorAgent",
             "success",
             "用户已批准 SQL 执行，恢复挂起的 Graph。",
         )
+        yield _sse_event("trace", approval_step.model_dump())
         from langgraph.types import Command
         stream_iter = graph.stream(Command(resume={"approved": True}), config, stream_mode="updates")
     else:
@@ -159,6 +174,7 @@ async def _stream_agent_events(request: ChatRequest):
     final_citations: list[dict] = []
     hitl_interrupted = False
     rag_hit = False
+    last_node_event_at = perf_counter()
 
     for event in stream_iter:
         # ── Handle HITL interrupt ────────────────────────────────────
@@ -171,13 +187,14 @@ async def _stream_agent_events(request: ChatRequest):
                 interrupt_info.value if hasattr(interrupt_info, "value") else interrupt_info
             )
 
-            trace.add(
+            interrupted_step = trace.add(
                 "hitl_interrupted",
                 "EvaluatorAgent",
                 "success",
                 "图已挂起，等待用户审批。",
                 metadata={"interrupt": interrupt_value},
             )
+            yield _sse_event("trace", interrupted_step.model_dump())
 
             yield _sse_event("approval_needed", {
                 "reason": interrupt_value.get("reason", "需要人工审批"),
@@ -222,7 +239,10 @@ async def _stream_agent_events(request: ChatRequest):
                 sql = node_state.get("sql", "")
                 if sql:
                     _node_detail = "生成 SQL 查询"
-                    _node_meta = {"sql": sql[:200]}
+                    _node_meta = {
+                        "sql": sql[:200],
+                        "query_params": node_state.get("query_params", {}),
+                    }
             elif node_name == "sql_validate":
                 err = node_state.get("sql_error")
                 _node_detail = "SQL 校验通过" if not err else f"SQL 校验失败: {err}"
@@ -243,7 +263,11 @@ async def _stream_agent_events(request: ChatRequest):
                     _node_meta = {"error": err}
                 else:
                     _node_detail = f"返回 {rows} 行数据"
-                    _node_meta = {"row_count": rows, "columns": node_state.get("sql_columns", [])}
+                    _node_meta = {
+                        "row_count": rows,
+                        "columns": node_state.get("sql_columns", []),
+                        "metric": node_state.get("query_params", {}).get("metric"),
+                    }
             elif node_name == "sql_reflect":
                 _node_detail = f"第 {node_state.get('sql_retry_count', 0)} 次重试，分析错误并修正 SQL"
             elif node_name == "format_sql_answer":
@@ -268,14 +292,23 @@ async def _stream_agent_events(request: ChatRequest):
             elif node_name == "generate_final":
                 _node_detail = "完成"
 
-            yield _sse_event("trace", {
-                "node_name": node_name,
-                "agent_role": _node_role_map.get(node_name, "EvaluatorAgent"),
-                "status": _node_status,
-                "detail": _node_detail,
-                "latency_ms": 0,
-                "metadata": _node_meta,
-            })
+            trace_step = None
+            if node_name != "classify_intent":
+                node_completed_at = perf_counter()
+                node_latency_ms = (node_completed_at - last_node_event_at) * 1000
+                last_node_event_at = node_completed_at
+                trace_step = trace.add(
+                    node_name,
+                    _node_role_map.get(node_name, "EvaluatorAgent"),
+                    _node_status,
+                    _node_detail,
+                    latency_ms=node_latency_ms,
+                    metadata=_node_meta,
+                    kind="langgraph_node",
+                    error_type="NodeExecutionError" if _node_status == "error" else None,
+                    error_message=_node_detail if _node_status == "error" else None,
+                )
+                yield _sse_event("trace", trace_step.model_dump())
 
             # ── route (from classify_intent) ─────────────────────────
             if node_name == "classify_intent" and node_state.get("route"):
@@ -308,6 +341,8 @@ async def _stream_agent_events(request: ChatRequest):
             if node_name in ("rag_retrieve", "hybrid_run") and node_state.get("citations_data"):
                 final_citations = node_state["citations_data"]
                 rag_hit = True
+                if trace_step is not None:
+                    trace.save_retrievals(trace_step.span_id, final_citations)
                 yield _sse_event("retrieval", {
                     "citation_count": len(final_citations),
                 })
@@ -318,7 +353,17 @@ async def _stream_agent_events(request: ChatRequest):
 
     # ── If HITL interrupted, emit done and stop ──────────────────────
     if hitl_interrupted:
-        yield _sse_event("done", {"trace_id": trace.trace_id, "session_id": session_id})
+        trace.finish_run(
+            status="interrupted",
+            route=route,
+            route_confidence=confidence,
+        )
+        yield _sse_event("done", {
+            "trace_id": trace.trace_id,
+            "session_id": session_id,
+            "status": "interrupted",
+            "span_count": len(trace.steps),
+        })
         return
 
     # ── 5. Retrieve final state from the graph ───────────────────────
@@ -334,9 +379,26 @@ async def _stream_agent_events(request: ChatRequest):
     if not output_result.passed:
         slog.warning("output_guard_triggered", session_id=session_id, reason=output_result.reason)
         answer = "抱歉，生成的回复内容需要审核，请稍后重试。"
+    output_guard_step = trace.add(
+        "output_guard",
+        "EvaluatorAgent",
+        "success" if output_result.passed else "warning",
+        output_result.reason or "输出安全检查通过。",
+        kind="guard",
+    )
+    yield _sse_event("trace", output_guard_step.model_dump())
 
     # ── Update memory ────────────────────────────────────────────────
     update_memory(memory, request_message, answer)
+    memory_step = trace.add(
+        "update_memory",
+        "MemoryAgent",
+        "success",
+        "更新会话记忆。",
+        metadata={"recent_turns": len(memory.recent_turns)},
+        kind="memory",
+    )
+    yield _sse_event("trace", memory_step.model_dump())
 
     # ── 6. Stream answer as answer_delta events (~20 chars each) ─────
     chunk_size = 20
@@ -346,6 +408,20 @@ async def _stream_agent_events(request: ChatRequest):
 
     # ── 7. Yield metrics and done events ─────────────────────────────
     latency_ms = round((perf_counter() - started) * 1000, 2)
+    final_step = trace.add(
+        "final_answer",
+        "EvaluatorAgent",
+        "success",
+        "完成答案生成并准备结束流式响应。",
+        kind="llm",
+    )
+    yield _sse_event("trace", final_step.model_dump())
+    trace.finish_run(
+        status="success",
+        route=route,
+        route_confidence=final_state.get("route_confidence", confidence),
+        citation_count=len(final_citations),
+    )
     yield _sse_event("metrics", {
         "latency_ms": latency_ms,
         "tool_calls": trace.tool_calls,
@@ -353,4 +429,9 @@ async def _stream_agent_events(request: ChatRequest):
         "route_confidence": final_state.get("route_confidence", confidence),
     })
 
-    yield _sse_event("done", {"trace_id": trace.trace_id, "session_id": session_id})
+    yield _sse_event("done", {
+        "trace_id": trace.trace_id,
+        "session_id": session_id,
+        "status": "success",
+        "span_count": len(trace.steps),
+    })

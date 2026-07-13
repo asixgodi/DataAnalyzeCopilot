@@ -55,6 +55,16 @@ SQL_TEMPLATES: dict[str, str] = {
         GROUP BY p.category, o.month
     """,
 
+    "ticket_count": """
+        SELECT p.category, t.month,
+               COUNT(t.id) AS ticket_count
+        FROM tickets t
+        JOIN products p ON t.product_id = p.id
+        WHERE t.month = '{time_range}'
+          {category_filter}
+        GROUP BY p.category, t.month
+    """,
+
     "ticket_distribution": """
         SELECT t.reason, COUNT(*) AS ticket_count,
                ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) AS percentage

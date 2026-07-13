@@ -7,6 +7,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.chat import router as chat_router
+from app.api.traces import router as traces_router
 from app.core.config import settings
 
 # ── LangSmith 可观测性初始化 ───────────────────────────────────────────
@@ -71,3 +72,4 @@ def health_check() -> dict[str, str]:
 
 # 挂载子路由
 app.include_router(chat_router, prefix="/api", tags=["chat"])
+app.include_router(traces_router, prefix="/api", tags=["traces"])

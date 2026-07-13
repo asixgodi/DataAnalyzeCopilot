@@ -136,7 +136,11 @@ class OutputGuard:
                 )
 
         if sql_rows and route in ("sql", "hybrid"):
-            if self._detect_number_hallucination(answer, sql_rows):
+            if self._detect_number_hallucination(
+                answer,
+                sql_rows,
+                citations=citations if route == "hybrid" else None,
+            ):
                 return GuardResult(
                     passed=False,
                     reason="检测到答案中的数字与查询结果可能不一致，请核实。",
@@ -154,10 +158,15 @@ class OutputGuard:
 
     @staticmethod
     def _detect_number_hallucination(
-        answer: str, rows: list[dict[str, Any]]
+        answer: str,
+        rows: list[dict[str, Any]],
+        citations: list[dict[str, Any]] | None = None,
     ) -> bool:
         """
-        简易幻觉检测：提取答案中的数字，与 SQL 结果交叉验证。
+        简易幻觉检测：提取答案中的数字，与证据交叉验证。
+
+        SQL 路由只认可 SQL 结果；Hybrid 路由还认可最终 Citation
+        摘要中的数字，例如退货期限、SLA 或政策阈值。
         启发式方法，只在大量不匹配时触发。
         """
         answer_numbers = set(re.findall(r"\d+\.?\d*", answer))
@@ -167,6 +176,10 @@ class OutputGuard:
                 if isinstance(value, (int, float)):
                     result_numbers.add(str(value))
                     result_numbers.add(str(round(float(value), 2)))
+
+        for citation in citations or []:
+            snippet = str(citation.get("snippet", ""))
+            result_numbers.update(re.findall(r"\d+\.?\d*", snippet))
 
         # 排除常见无害数字
         safe_numbers = {"0", "1", "2", "100", "0.0", "1.0"}

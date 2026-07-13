@@ -43,7 +43,7 @@ class SqlResult(BaseModel):
     row_count: int
     error: str | None = None
 
-
+# 单个执行步骤的trace信息
 class TraceStep(BaseModel):
     node_name: str
     agent_role: str = "system"
@@ -51,6 +51,13 @@ class TraceStep(BaseModel):
     detail: str
     latency_ms: float = 0
     metadata: dict[str, Any] = Field(default_factory=dict)
+    trace_id: str = ""
+    span_id: str = ""
+    parent_span_id: str | None = None
+    sequence: int = 0
+    kind: str = "agent_node"
+    started_at: str = ""
+    ended_at: str = ""
 
 
 class ApprovalContext(BaseModel):

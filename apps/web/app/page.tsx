@@ -3,6 +3,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getApiBaseUrl } from "@/lib/api";
 import { streamChat } from "@/lib/streamClient";
+import { fetchTrace } from "@/lib/traceClient";
 import { ChatBubble } from "@/components/ChatBubble";
 import { TracePanel } from "@/components/TracePanel";
 import type { ChatResponse, Message, Session, TraceStep, StreamingState } from "@/components/types";
@@ -289,23 +290,44 @@ export default function HomePage() {
               statusText: `延迟 ${data.latency_ms}ms`,
             }));
           },
-          onDone: (data) => {
+          onDone: async (data) => {
             const m = metricsRef.current;
+            let authoritativeSteps = stepsRef.current as TraceStep[];
+            let authoritativeCitations: ChatResponse["citations"] = [];
+            let authoritativeRoute = (routeRef.current || "sql") as ChatResponse["route"];
+            let authoritativeLatency = m.latency_ms;
+            let authoritativeToolCalls = m.tool_calls;
+            let authoritativeCitationCount = citationCountRef.current;
+            let authoritativeConfidence = m.route_confidence;
+
+            try {
+              const trace = await fetchTrace(apiBaseUrl, data.trace_id);
+              authoritativeSteps = trace.spans;
+              authoritativeCitations = trace.retrievals;
+              authoritativeRoute = (trace.run.route || authoritativeRoute) as ChatResponse["route"];
+              authoritativeLatency = trace.run.duration_ms;
+              authoritativeToolCalls = trace.run.tool_calls;
+              authoritativeCitationCount = trace.run.citation_count;
+              authoritativeConfidence = trace.run.route_confidence;
+            } catch {
+              // The SSE projection remains a usable fallback if trace lookup fails.
+            }
+
             const assistantMessage: Message = {
               role: "assistant",
               content: answerRef.current,
               response: {
                 answer: answerRef.current,
-                route: (routeRef.current || "sql") as ChatResponse["route"],
+                route: authoritativeRoute,
                 trace_id: data.trace_id,
-                steps: stepsRef.current as TraceStep[],
-                citations: [],
+                steps: authoritativeSteps,
+                citations: authoritativeCitations,
                 sql_result: null,
                 metrics: {
-                  latency_ms: m.latency_ms,
-                  tool_calls: m.tool_calls,
-                  citations: citationCountRef.current,
-                  route_confidence: m.route_confidence,
+                  latency_ms: authoritativeLatency,
+                  tool_calls: authoritativeToolCalls,
+                  citations: authoritativeCitationCount,
+                  route_confidence: authoritativeConfidence,
                 },
                 memory: {
                   session_id: data.session_id,
@@ -474,25 +496,34 @@ export default function HomePage() {
       <aside className="sidebar">
         <div className="brand">
           <span className="brandMark" aria-hidden="true">
-            DB
+            <svg viewBox="0 0 44 44" fill="none">
+              <path d="M10 28.5V15.5C10 13.57 11.57 12 13.5 12h17c1.93 0 3.5 1.57 3.5 3.5v13c0 1.93-1.57 3.5-3.5 3.5h-17A3.5 3.5 0 0 1 10 28.5Z" stroke="currentColor" strokeWidth="2.2" />
+              <path d="M15 25.5l4.2-4.2 3.4 2.8 6.4-7" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
+              <circle cx="29" cy="17" r="2.4" fill="currentColor" />
+            </svg>
           </span>
-          <div>
-            <strong>售后分析 Copilot</strong>
-            <span>Agent + SQL + RAG</span>
+          <div className="brandCopy">
+            <span className="brandEyebrow">AFTERCARE INTELLIGENCE</span>
+            <strong>售后分析工作台</strong>
+            <span className="brandSubline"><i aria-hidden="true" />系统已连接</span>
           </div>
         </div>
 
         {/* Session List */}
         <div className="sessionSection">
           <div className="sessionHeader">
-            <span className="sessionLabel">会话列表</span>
+            <div>
+              <span className="sessionLabel">工作会话</span>
+              <span className="sessionMeta">{sessions.length} 个分析上下文</span>
+            </div>
             <button
               type="button"
               className="newSessionBtn"
               onClick={createNewSession}
               title="新建会话"
             >
-              +
+              <span aria-hidden="true">+</span>
+              <span>新建</span>
             </button>
           </div>
           <div className="sessionList">
@@ -546,24 +577,23 @@ export default function HomePage() {
           className="exampleList"
           aria-label="示例问题"
         >
+          <div className="exampleHeader">
+            <span>快速试问</span>
+            <small>选择一个起点</small>
+          </div>
           {examples.map((item) => (
             <button
               key={item}
               type="button"
               onClick={() => void submit(item)}
             >
-              <span className="buttonIcon" aria-hidden="true">
-                ▶
+              <span className="exampleIcon" aria-hidden="true">
+                ↗
               </span>
               <span>{item}</span>
             </button>
           ))}
         </section>
-
-        <div className="apiBox">
-          <span>API</span>
-          <strong>{apiBaseUrl}</strong>
-        </div>
       </aside>
 
       {/* Center: Chat Area */}

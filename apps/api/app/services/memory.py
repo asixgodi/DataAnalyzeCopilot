@@ -27,6 +27,7 @@ from typing import TypedDict
 import httpx
 
 from app.core.config import settings
+from app.services.intent import extract_intent_slots
 
 # ── 数据库层 ──────────────────────────────────────────────────────────
 
@@ -78,7 +79,7 @@ def _ensure_tables() -> None:
         conn.close()
 
 
-# ── 数据结构 ──────────────────────────────────────────────────────────
+# ── 数据结构  
 
 
 @dataclass
@@ -262,15 +263,28 @@ def _stringify_profile(profile: dict[str, object]) -> dict[str, str]:
 _FOLLOWUP_ACTION_TERMS = [
     "那", "呢", "这个", "这些", "上面", "前面", "刚才", "继续", "接着", "往下",
     "按这个", "照这个", "就查", "查一下", "补一下", "补充", "第一个", "第二个",
-    "第三个", "第四个", "1", "2", "3", "4",
+    "第三个", "第四个",
 ]
 
 
 def _is_followup_action(message: str) -> bool:
     normalized = message.strip()
-    if len(normalized) <= 12 and any(term in normalized for term in ["查", "继续", "接着", "补", "按"]):
+    slots = extract_intent_slots(normalized)
+    if slots.confidence >= 0.9 and slots.action != "clarify" and (
+        slots.metric or slots.needs_docs
+    ):
+        return False
+    if re.fullmatch(r"\s*第?([一二三四]|[1-4])(个|条|项)?[呢吧。！？?]*\s*", normalized):
         return True
-    return any(term in normalized for term in _FOLLOWUP_ACTION_TERMS)
+    if any(normalized.startswith(term) for term in ["那", "这个", "这些", "上面", "前面", "刚才"]):
+        return True
+    if len(normalized) <= 12 and normalized.rstrip("。！？?").endswith("呢"):
+        return True
+    if len(normalized) <= 12 and any(
+        term in normalized for term in ["继续", "接着", "补一下", "补充", "按这个", "照这个", "查一下"]
+    ):
+        return True
+    return normalized in _FOLLOWUP_ACTION_TERMS
 
 
 def _extract_context_text(previous: dict[str, str]) -> str:
@@ -278,26 +292,11 @@ def _extract_context_text(previous: dict[str, str]) -> str:
 
 
 def _infer_month(text: str) -> str:
-    match = re.search(r"(20\d{2})[-年/ ]?(0?[1-9]|1[0-2])月?", text)
-    if match:
-        return f"{match.group(1)}-{int(match.group(2)):02d}"
-    match = re.search(r"([1-9]|1[0-2])月", text)
-    if match:
-        return f"2026-{int(match.group(1)):02d}"
-    return "2026-04"
+    return extract_intent_slots(text).time_range or "2026-04"
 
 
 def _infer_category(text: str) -> str:
-    category_map = {
-        "服装": "服装",
-        "衣服": "服装",
-        "鞋靴": "鞋靴",
-        "鞋": "鞋靴",
-        "数码": "数码",
-        "耳机": "数码",
-        "手表": "数码",
-    }
-    return next((cat for kw, cat in category_map.items() if kw in text), "服装")
+    return extract_intent_slots(text).category or "服装"
 
 
 def _infer_metric(text: str) -> str:
@@ -364,15 +363,20 @@ def _select_suggested_item(message: str, items: list[str]) -> str | None:
             if matched:
                 return matched
 
-    return items[0]
+    return None
 
 
 def _build_explicit_followup_query(message: str, previous: dict[str, str]) -> str | None:
-    context = _extract_context_text(previous)
     items = _extract_suggested_items(previous.get("assistant", ""))
     selected = _select_suggested_item(message, items)
-    month = _infer_month(message + "\n" + context)
-    category = _infer_category(message + "\n" + context)
+    current_slots = extract_intent_slots(message)
+    previous_slots = extract_intent_slots(previous.get("user", ""))
+
+    # 本轮明确提供的字段优先；仅在缺失时继承上一轮，避免“五月份呢”
+    # 被上一轮“4月”的上下文覆盖。
+    month = current_slots.time_range or previous_slots.time_range or "2026-04"
+    category = current_slots.category or previous_slots.category or "服装"
+    metric = current_slots.metric or previous_slots.metric
 
     if selected:
         return (
@@ -383,19 +387,28 @@ def _build_explicit_followup_query(message: str, previous: dict[str, str]) -> st
             f"如果需要默认条件，使用月份 {month}，类目 {category}。"
         )
 
-    if any(keyword in message for keyword in ["原因", "分布", "工单", "尺码", "色差", "面料"]):
-        return f"查询 {month} {category}类目客服工单/退款原因分布，重点关注尺码、色差、面料等原因。"
-    if any(keyword in message for keyword in ["sku", "SKU", "商品", "款式", "同款"]):
+    if metric == "refund_rate":
+        return f"查询 {month} {category}类目整体退款率，并返回订单数、退款数和退款率。"
+    if metric == "top_refund_products":
         return f"查询 {month} {category}类目退款次数最高的商品或 SKU，并返回退款次数和退款金额。"
-    if any(keyword in message for keyword in ["退款率", "整体", "环比", "上月", "预警"]):
-        return f"查询 {month} {category}类目整体退款率，并用于判断是否超过预警线。"
-    if any(keyword in message for keyword in ["渠道", "活动", "促销", "直播", "清仓"]):
-        return f"查询 {month} {category}类目按活动渠道或销售渠道拆分的退款情况。"
+    if metric == "ticket_distribution":
+        return f"查询 {month} {category}类目客服工单/退款原因分布，重点关注尺码、色差、面料等原因。"
+    if metric == "ticket_count":
+        return f"查询 {month} {category}类目售后工单数量。"
+    if metric == "refund_count":
+        return f"查询 {month} {category}类目退款单数。"
+    if metric == "refund_amount_sum":
+        return f"查询 {month} {category}类目退款总金额。"
+    if metric == "order_count":
+        return f"查询 {month} {category}类目订单数量。"
+    if metric == "review_score_avg":
+        return f"查询 {month} {category}类目平均评分和差评情况。"
 
     return None
 
-
+# 指代消解
 def resolve_followup(message: str, memory: SessionMemory) -> str:
+    # 判断有没有历史消息 或者 是不是追问
     if not memory.recent_turns or not _is_followup_action(message):
         return message
 
@@ -404,19 +417,25 @@ def resolve_followup(message: str, memory: SessionMemory) -> str:
     if explicit_query:
         return explicit_query
 
-    category_map = {"服装": "服装", "衣服": "服装", "鞋": "鞋靴", "鞋靴": "鞋靴", "数码": "数码", "耳机": "数码"}
-    matched = next((cat for kw, cat in category_map.items() if kw in message), None)
+    current_slots = extract_intent_slots(message)
+    matched = current_slots.category
 
     if matched:
-        context = _extract_context_text(previous)
-        month = _infer_month(message + "\n" + context)
-        metric = _infer_metric(message + "\n" + previous.get("user", ""))
+        previous_slots = extract_intent_slots(previous.get("user", ""))
+        month = current_slots.time_range or previous_slots.time_range or "2026-04"
+        metric = current_slots.metric or previous_slots.metric or _infer_metric(previous.get("user", ""))
         if metric == "refund_rate":
-            return f"查询 {month} {matched}类目整体退款率，并返回订单数、退款数和退款率。"
+            return (
+                f"上一轮问题：{previous['user']}。"
+                f"查询 {month} {matched}类目整体退款率，并返回订单数、退款数和退款率。"
+            )
         if metric == "ticket_reason":
-            return f"查询 {month} {matched}类目客服工单/退款原因分布。"
+            return f"上一轮问题：{previous['user']}。查询 {month} {matched}类目客服工单/退款原因分布。"
         if metric == "top_refund_products":
-            return f"查询 {month} {matched}类目退款次数最高的商品或 SKU，并返回退款次数和退款金额。"
+            return (
+                f"上一轮问题：{previous['user']}。"
+                f"查询 {month} {matched}类目退款次数最高的商品或 SKU，并返回退款次数和退款金额。"
+            )
         return f"查询 {month} {matched}类目的同一指标。上一轮问题是：{previous['user']}"
     return (
         f"上一轮问题：{previous['user']}，回答：{previous['assistant'][:500]}。"
@@ -544,7 +563,7 @@ def update_memory(
 ) -> None:
     """每轮对话后：更新内存 → 触发摘要/画像 → 持久化到 DB。"""
     memory.recent_turns.append(
-        {"user": user_message, "assistant": assistant_answer[:2000]}
+        {"user": user_message, "assistant": assistant_answer[:300]}
     )
     if len(memory.recent_turns) > 10:
         memory.recent_turns = memory.recent_turns[-10:]

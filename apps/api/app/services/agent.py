@@ -39,6 +39,7 @@ from app.schemas.chat import (
     SqlResult,
 )
 from app.services.guards import InputGuard, OutputGuard
+from app.services.intent import extract_intent_slots
 from app.services.llm_client import LLMClient, get_llm_client
 from app.services.memory import (
     PromptContext,
@@ -92,6 +93,7 @@ def _init_state(question: str, session_id: str, prompt_ctx: PromptContext | None
         "sql_row_count": 0,
         "sql_error": None,
         "sql_retry_count": 0,
+        "query_params": {},
         "citations_data": [],
         "answer_text": "",
         "need_clarification": False,
@@ -112,10 +114,18 @@ def _build_checkpointer():
     try:
         from langgraph.checkpoint.sqlite import SqliteSaver
 
-        db_dir = settings.resolve_api_path("../../data")
-        db_dir.mkdir(parents=True, exist_ok=True)
-        db_path = str(db_dir / "checkpoints.db")
-        conn = sqlite3.connect(db_path, check_same_thread=False)
+        db_path = settings.resolve_api_path(settings.checkpoint_database_path)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=10)
+        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        integrity = conn.execute("PRAGMA quick_check").fetchone()
+        if not integrity or integrity[0] != "ok":
+            conn.close()
+            raise sqlite3.DatabaseError(
+                f"Checkpoint database integrity check failed: {integrity!r}"
+            )
         logger.info("Using SqliteSaver at %s", db_path)
         return SqliteSaver(conn)
     except Exception as exc:
@@ -236,13 +246,21 @@ def _generate_sql_v2(
     question: str,
     prompt_ctx: PromptContext | None = None,
     tool_error: str | None = None,
+    params: QueryParams | None = None,
 ) -> str:
     """SQL 生成 v2: LLM 参数抽取 → 参数化模板 → LLM 全量生成 → 旧模板兜底"""
     # Phase 1: 参数抽取
-    try:
-        params = extract_query_params(question)
-    except Exception:
-        params = QueryParams(time_range="2026-04")
+    if params is None:
+        try:
+            params = extract_query_params(question)
+        except Exception:
+            params = QueryParams(time_range="2026-04")
+
+    if tool_error and settings.siliconflow_api_key:
+        try:
+            return _generate_sql_with_llm(question, list_tables(), prompt_ctx, tool_error)
+        except Exception as exc:
+            logger.warning("LLM SQL repair failed: %s", exc)
 
     # Phase 2: 模板匹配
     template_sql = build_sql_from_params(params)
@@ -292,56 +310,16 @@ def _generate_sql(
 
 
 def route_question(question: str) -> tuple[str, str, float]:
-    text = question.lower()
-    weak = ["随便", "不知道", "都行", "看看"]
-    policy_action_terms = [
-        "应该", "应当", "需要", "触发", "进入", "走什么", "什么流程",
-        "怎么处理", "如何处理", "如何判断", "怎么判断", "流程", "规则",
-        "sop", "处置", "升级", "人工审核", "品控", "质量控制",
-    ]
-    metric_query_terms = [
-        "多少", "几", "统计", "查询", "退款率", "订单数", "退款数", "工单数",
-        "金额", "最高", "排行", "排名", "top", "对比", "环比", "同比",
-    ]
-    data_terms = [
-        "4月", "5月", "3月", "订单", "商品", "工单", "评价",
-        "最高", "多少", "对比", "升高", "下降", "退款率", "销量",
-        "排名", "top", "数量", "统计", "查询",
-    ]
-    doc_terms = [
-        "政策", "规则", "sop", "口径", "定义", "为什么", "原因",
-        "结合", "证据", "会员", "物流", "分类标准", "字段说明",
-        "规范", "流程", "指标",
-    ]
-
-    has_data = any(kw in text for kw in data_terms)
-    has_doc = any(kw in text for kw in doc_terms)
-    has_policy_action = any(kw in text for kw in policy_action_terms)
-    has_metric_query = any(kw in text for kw in metric_query_terms)
-    has_definition_intent = any(kw in text for kw in ["口径", "定义", "规则", "流程", "SOP", "sop"])
-    has_time_or_stat_intent = any(
-        kw in text for kw in ["3月", "4月", "5月", "2026-", "统计", "查询", "多少", "对比", "环比", "同比"]
-    )
-
-    if len(question.strip()) < 4 or any(kw in text for kw in weak):
-        return ROUTE_CLARIFY, "问题信息不足，需要先追问分析范围。", 0.72
-
-    if has_policy_action and not has_metric_query:
-        return ROUTE_RAG, "问题是在询问业务规则、SOP 或触发流程，优先检索知识库文档。", 0.9
-
-    if has_definition_intent and not has_time_or_stat_intent:
-        return ROUTE_RAG, "问题是在询问指标口径、定义、规则或流程，优先检索知识库文档。", 0.9
-
-    if has_data and has_doc:
-        return ROUTE_HYBRID, "问题同时需要结构化数据和文档证据。", 0.91
-
-    if has_doc and not has_data:
-        return ROUTE_RAG, "问题主要需要检索业务政策、SOP 或指标口径。", 0.84
-
-    if has_data:
-        return ROUTE_SQL, "问题主要需要查询结构化售后数据。", 0.86
-
-    return ROUTE_CLARIFY, "暂未识别出明确的数据查询或知识检索意图，需追问。", 0.65
+    slots = extract_intent_slots(question)
+    if slots.missing_fields or (not slots.needs_data and not slots.needs_docs):
+        return ROUTE_CLARIFY, (
+            f"问题缺少关键信息：{', '.join(slots.missing_fields) or '分析目标'}。"
+        ), slots.confidence
+    if slots.needs_data and slots.needs_docs:
+        return ROUTE_HYBRID, f"问题同时需要结构化数据和文档证据。{slots.reason}", slots.confidence
+    if slots.needs_data:
+        return ROUTE_SQL, f"问题需要查询结构化售后数据。{slots.reason}", slots.confidence
+    return ROUTE_RAG, f"问题需要检索业务政策、SOP、流程或指标定义。{slots.reason}", slots.confidence
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
@@ -366,13 +344,10 @@ def _should_use_llm_router(question: str, rule_route: str, rule_confidence: floa
         return False
     if mode == "llm":
         return True
-    review_terms = [
-        "应该", "触发", "流程", "规则", "SOP", "sop", "SKU", "sku",
-        "为什么", "原因", "结合", "判断", "处理", "升级", "质量争议",
-    ]
-    return rule_confidence < settings.agent_router_confidence_threshold or any(
-        term in question for term in review_terms
-    )
+    slots = extract_intent_slots(question)
+    if slots.missing_fields:
+        return False
+    return rule_confidence < settings.agent_router_confidence_threshold
 
 
 def _classify_question_with_llm(
@@ -645,7 +620,8 @@ def sql_retrieve_schema_node(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def sql_generate_node(state: dict[str, Any]) -> dict[str, Any]:
-    question = state["question"]
+    original_question = state["question"]
+    question = original_question
     if state.get("sql_retry_count", 0) > 0:
         error_msg = state.get("sql_error", "")
         question = (
@@ -654,14 +630,21 @@ def sql_generate_node(state: dict[str, Any]) -> dict[str, Any]:
             f"请修正 SQL 并重新生成。"
         )
     try:
+        params = (
+            QueryParams(**state["query_params"])
+            if state.get("query_params")
+            else extract_query_params(original_question)
+        )
         sql = _generate_sql_v2(
             question,
             prompt_ctx=state.get("prompt_ctx"),
             tool_error=state.get("sql_error") if state.get("sql_retry_count", 0) > 0 else None,
+            params=params,
         )
     except Exception:
+        params = QueryParams(time_range="2026-04")
         sql = build_sql_for_question(state["question"])
-    return _update(state, sql=sql)
+    return _update(state, sql=sql, query_params=params.model_dump(), sql_error=None)
 
 
 def sql_validate_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -719,16 +702,45 @@ def risk_check_condition(
     return "execute"
 
 
+_REQUIRED_METRIC_COLUMNS: dict[str, set[str]] = {
+    "refund_rate": {"refund_rate", "order_count", "refund_count"},
+    "refund_count": {"refund_count"},
+    "refund_amount_sum": {"total_amount"},
+    "order_count": {"order_count"},
+    "ticket_count": {"ticket_count"},
+    "ticket_distribution": {"reason", "ticket_count"},
+    "top_refund_products": {"name", "refund_count"},
+    "review_score_avg": {"avg_rating", "review_count"},
+}
+
+
+def validate_metric_result(metric: str, columns: list[str]) -> str | None:
+    required = _REQUIRED_METRIC_COLUMNS.get(metric)
+    if not required:
+        return None
+    missing = required - set(columns)
+    if not missing:
+        return None
+    return (
+        f"SQL 结果与请求指标不匹配：metric={metric}，"
+        f"缺少列={sorted(missing)}，实际列={columns}"
+    )
+
+
 def sql_execute_node(state: dict[str, Any]) -> dict[str, Any]:
     if state.get("sql_error"):
         return _update(state)
     result = execute_readonly_sql(state["sql"])
+    semantic_error = None
+    if not result.error:
+        metric = str(state.get("query_params", {}).get("metric", ""))
+        semantic_error = validate_metric_result(metric, result.columns)
     return _update(
         state,
         sql_columns=result.columns,
         sql_rows=[dict(r) for r in result.rows],
         sql_row_count=result.row_count,
-        sql_error=result.error,
+        sql_error=result.error or semantic_error,
     )
 
 
@@ -773,24 +785,67 @@ def format_sql_answer_node(state: dict[str, Any]) -> dict[str, Any]:
     else:
         rows = state["sql_rows"]
         row = rows[0]
-        if "refund_rate" in row:
-            text = (
-                f"{row.get('month', '')} {row.get('category', '')}类目的订单数为 "
-                f"{row.get('order_count', 'N/A')}，退款数为 {row.get('refund_count', 'N/A')}，"
-                f"退款率为 {row['refund_rate']}%。"
-            )
-        elif "ticket_count" in row:
+        metric = str(state.get("query_params", {}).get("metric", ""))
+        if metric == "refund_rate":
+            if "period" in row and len(rows) >= 2:
+                current = next((item for item in rows if item.get("period") == "current"), rows[0])
+                previous = next((item for item in rows if item.get("period") == "previous"), rows[1])
+                change = ""
+                try:
+                    diff = float(current["refund_rate"]) - float(previous["refund_rate"])
+                    direction = "升高" if diff > 0 else ("下降" if diff < 0 else "持平")
+                    change = f"，环比{direction} {abs(diff):.2f} 个百分点"
+                except (KeyError, TypeError, ValueError):
+                    pass
+                text = (
+                    f"{current.get('month', '')} {current.get('category', '')}类目退款率为 "
+                    f"{current.get('refund_rate', 'N/A')}%，上月为 {previous.get('refund_rate', 'N/A')}%{change}。"
+                )
+            else:
+                text = (
+                    f"{row.get('month', '')} {row.get('category', '')}类目的订单数为 "
+                    f"{row.get('order_count', 'N/A')}，退款数为 {row.get('refund_count', 'N/A')}，"
+                    f"退款率为 {row.get('refund_rate', 'N/A')}%。"
+                )
+        elif metric == "ticket_distribution":
             parts = [
                 f"{item.get('reason', '未知原因')} {item['ticket_count']} 次"
                 for item in rows
             ]
             text = "客服工单原因分布：" + "，".join(parts) + "。"
-        elif "refund_count" in row:
+        elif metric == "ticket_count":
+            text = (
+                f"{row.get('month', '')} {row.get('category', '')}类目客服工单数为 "
+                f"{row.get('ticket_count', 'N/A')} 单。"
+            )
+        elif metric == "top_refund_products":
             parts = []
             for item in rows:
-                name = item.get("name") or f"商品#{item.get('product_id', '?')}"
+                name = item.get("name") or f"商品#{item.get('product_id', '未知')}"
                 parts.append(f"{name} {item['refund_count']} 次退款")
             text = "退款次数最高的商品：" + "，".join(parts) + "。"
+        elif metric == "refund_count":
+            text = (
+                f"{row.get('month', '')} {row.get('category', '')}类目退款数为 "
+                f"{row.get('refund_count', 'N/A')} 单，退款金额合计 "
+                f"{row.get('total_refund_amount', row.get('total_amount', 'N/A'))} 元。"
+            )
+        elif metric == "refund_amount_sum":
+            text = (
+                f"{row.get('month', '')} {row.get('category', '')}类目退款总金额为 "
+                f"{row.get('total_amount', 'N/A')} 元，平均退款金额为 "
+                f"{row.get('avg_amount', 'N/A')} 元，共 {row.get('refund_count', 'N/A')} 笔。"
+            )
+        elif metric == "order_count":
+            text = (
+                f"{row.get('month', '')} {row.get('category', '')}类目订单数为 "
+                f"{row.get('order_count', 'N/A')} 单，订单金额合计 {row.get('total_amount', 'N/A')} 元。"
+            )
+        elif metric == "review_score_avg":
+            text = (
+                f"{row.get('category', '')}类目平均评分为 {row.get('avg_rating', 'N/A')}，"
+                f"共 {row.get('review_count', 'N/A')} 条评价，其中差评 {row.get('negative_count', 'N/A')} 条。"
+            )
         else:
             columns = state.get("sql_columns", [])
             preview = "；".join(
@@ -847,10 +902,17 @@ def hybrid_run_node(state: dict[str, Any]) -> dict[str, Any]:
     updates: dict[str, Any] = {}
 
     try:
-        sql = _generate_sql_v2(question, prompt_ctx=state.get("prompt_ctx"))
+        params = extract_query_params(question)
+        sql = _generate_sql_v2(
+            question,
+            prompt_ctx=state.get("prompt_ctx"),
+            params=params,
+        )
     except Exception:
+        params = QueryParams(time_range="2026-04")
         sql = build_sql_for_question(question)
     updates["sql"] = sql
+    updates["query_params"] = params.model_dump()
 
     try:
         validate_readonly_sql(sql)
@@ -858,7 +920,10 @@ def hybrid_run_node(state: dict[str, Any]) -> dict[str, Any]:
         updates["sql_columns"] = sql_result.columns
         updates["sql_rows"] = [dict(r) for r in sql_result.rows]
         updates["sql_row_count"] = sql_result.row_count
-        updates["sql_error"] = sql_result.error
+        semantic_error = None
+        if not sql_result.error:
+            semantic_error = validate_metric_result(params.metric, sql_result.columns)
+        updates["sql_error"] = sql_result.error or semantic_error
     except ValueError as exc:
         updates["sql_error"] = str(exc)
         updates["sql_columns"] = []
@@ -1172,6 +1237,11 @@ def _build_approval_response(
         "success",
         "审批挂起中，返回审批请求。",
     )
+    trace.finish_run(
+        status="interrupted",
+        route=result.get("route", "sql"),
+        route_confidence=result.get("route_confidence", 0),
+    )
 
     latency_ms = round((perf_counter() - started) * 1000, 2)
     return ChatResponse(
@@ -1206,13 +1276,24 @@ def run_agent(request: ChatRequest) -> ChatResponse:
     started = perf_counter()
     session_id = request.session_id or f"session_{uuid4().hex[:8]}"
     memory = get_memory(session_id)
-    trace = TraceRecorder()
+    trace = TraceRecorder(
+        session_id=session_id,
+        question_summary=request.message,
+    )
 
     # ── Input Guard: 输入安全检查 ──
     input_guard = InputGuard()
     guard_result = input_guard.check(request.message)
     if not guard_result.passed:
         slog.warning("input_guard_rejected", session_id=session_id, reason=guard_result.reason)
+        trace.add(
+            "input_guard",
+            "ChatAgent",
+            "error",
+            guard_result.reason or "输入安全检查未通过。",
+            kind="guard",
+        )
+        trace.finish_run(status="error", route=ROUTE_CLARIFY)
         latency_ms = round((perf_counter() - started) * 1000, 2)
         return ChatResponse(
             answer=guard_result.reason or "抱歉，您的输入包含不合规内容，请重新描述您的问题。",
@@ -1268,6 +1349,22 @@ def run_agent(request: ChatRequest) -> ChatResponse:
     # ── 全局超时检查 ──
     if perf_counter() - started > GLOBAL_TIMEOUT_SECONDS:
         slog.warning("global_timeout", session_id=session_id, elapsed=f"{perf_counter() - started:.1f}s")
+        timeout_error = TimeoutError("Agent request timed out before graph execution")
+        trace.add(
+            "global_timeout",
+            "EvaluatorAgent",
+            "error",
+            str(timeout_error),
+            kind="system",
+            error_type=type(timeout_error).__name__,
+            error_message=str(timeout_error),
+        )
+        trace.finish_run(
+            status="error",
+            route=route,
+            route_confidence=confidence,
+            error=timeout_error,
+        )
         latency_ms = round((perf_counter() - started) * 1000, 2)
         return ChatResponse(
             answer="抱歉，请求处理超时，请稍后重试或简化您的问题。",
@@ -1325,6 +1422,22 @@ def run_agent(request: ChatRequest) -> ChatResponse:
     # ── 全局超时检查（图执行后） ──
     if perf_counter() - started > GLOBAL_TIMEOUT_SECONDS:
         slog.warning("global_timeout_after_graph", session_id=session_id, elapsed=f"{perf_counter() - started:.1f}s")
+        timeout_error = TimeoutError("Agent request timed out after graph execution")
+        trace.add(
+            "global_timeout",
+            "EvaluatorAgent",
+            "error",
+            str(timeout_error),
+            kind="system",
+            error_type=type(timeout_error).__name__,
+            error_message=str(timeout_error),
+        )
+        trace.finish_run(
+            status="error",
+            route=route,
+            route_confidence=confidence,
+            error=timeout_error,
+        )
         latency_ms = round((perf_counter() - started) * 1000, 2)
         return ChatResponse(
             answer="抱歉，请求处理超时，请稍后重试或简化您的问题。",
@@ -1381,6 +1494,7 @@ def run_agent(request: ChatRequest) -> ChatResponse:
             metadata={
                 "sql": result.get("sql", ""),
                 "retry_count": result.get("sql_retry_count", 0),
+                "query_params": result.get("query_params", {}),
             },
         )
         trace.add(
@@ -1388,18 +1502,27 @@ def run_agent(request: ChatRequest) -> ChatResponse:
             "SQLAgent",
             "error" if result.get("sql_error") else "success",
             result.get("sql_error") or f"返回 {result.get('sql_row_count', 0)} 行。",
-            metadata={"row_count": result.get("sql_row_count", 0)},
+            metadata={
+                "row_count": result.get("sql_row_count", 0),
+                "columns": result.get("sql_columns", []),
+                "metric": result.get("query_params", {}).get("metric"),
+            },
         )
 
     if result["route"] in (ROUTE_RAG, ROUTE_HYBRID):
         trace.tool_calls += 1
         c_count = len(result.get("citations_data", []))
-        trace.add(
+        retrieval_step = trace.add(
             "retrieve_docs",
             "RAGAgent",
             "success" if c_count else "warning",
             f"检索到 {c_count} 条文档证据。",
             metadata={"citations": result.get("citations_data", [])},
+            kind="retrieval",
+        )
+        trace.save_retrievals(
+            retrieval_step.span_id,
+            result.get("citations_data", []),
         )
 
     if result["route"] == ROUTE_HYBRID:
@@ -1477,6 +1600,13 @@ def run_agent(request: ChatRequest) -> ChatResponse:
         )
 
     latency_ms = round((perf_counter() - started) * 1000, 2)
+
+    trace.finish_run(
+        status="success",
+        route=result["route"],
+        route_confidence=result.get("route_confidence", 0),
+        citation_count=len(citations),
+    )
 
     # HITL：interrupt 机制在前面的 __interrupt__ 检查中已处理。
     # 到达这里说明图正常完成（没有被挂起），不需要审批。

@@ -29,6 +29,7 @@ data/*.db
 data/*.sqlite
 data/vector_store/
 data/eval_results/
+data/backup/
 
 # Logs
 *.log
@@ -39,8 +40,10 @@ logs/
 Thumbs.db
 .vscode/
 .idea/
+nul
 
 # Documentation and plans
 docs/
 summary/
 agent-20-day-plan.md
+

@@ -53,17 +53,18 @@ class TestResolveFollowup:
         result = resolve_followup("查询5月数码类退款率", memory)
         assert result == "查询5月数码类退款率"
 
-    def test_followup_injects_previous_context(self):
+    def test_followup_explicit_month_overrides_previous_month(self):
         memory = SessionMemory()
         memory.recent_turns.append({
             "user": "4月服装类退款率是多少？",
             "assistant": "服装类退款率为16.77%。",
         })
-        # "呢" 触发追问 → 应注入上一轮上下文
+        # "呢" 触发追问，但本轮明确的 5 月必须优先于上一轮的 4 月。
         result = resolve_followup("5月情况呢？", memory)
-        assert "上一轮问题" in result
-        assert "4月服装类退款率是多少？" in result
-        assert "5月情况呢？" in result
+        assert "2026-05" in result
+        assert "服装" in result
+        assert "退款率" in result
+        assert "2026-04" not in result
 
     def test_followup_with_shoe_switches_category(self):
         memory = SessionMemory()
@@ -73,7 +74,20 @@ class TestResolveFollowup:
         })
         result = resolve_followup("那鞋靴呢？", memory)
         assert "鞋靴" in result
-        assert "4月服装类退款率是多少？" in result
+        assert "2026-04" in result
+        assert "退款率" in result
+
+    def test_followup_chinese_month_overrides_previous_month(self):
+        memory = SessionMemory()
+        memory.recent_turns.append({
+            "user": "4月服装类退款率是多少？",
+            "assistant": "服装类退款率为16.77%。",
+        })
+        result = resolve_followup("五月份呢？", memory)
+        assert "2026-05" in result
+        assert "服装" in result
+        assert "退款率" in result
+        assert "2026-04" not in result
 
 
 class TestUpdateMemory:

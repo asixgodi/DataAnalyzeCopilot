@@ -140,7 +140,10 @@ class LLMClient:
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
         retry=retry_if_exception_type(
-            (httpx.TimeoutException, httpx.RemoteProtocolError)
+            # TransportError covers short-lived TLS EOF, connection reset,
+            # read/write failures and the existing timeout/protocol failures.
+            # HTTP status errors remain non-retryable below.
+            httpx.TransportError
         ),
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,

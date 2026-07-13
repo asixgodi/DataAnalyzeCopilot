@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from app.schemas.chat import SqlResult
 from app.services.data_store import get_connection
+from app.services.intent import extract_intent_slots
 
 logger = logging.getLogger(__name__)
 
@@ -219,7 +220,7 @@ class QueryParams(BaseModel):
     category: str | None = Field(None, description="商品类目：服装/鞋靴/数码")
     metric: str = Field("refund_rate", description="指标类型")
     # 可选 metric：
-    #   refund_rate, refund_count, order_count,
+    #   refund_rate, refund_count, order_count, ticket_count,
     #   ticket_distribution, top_refund_products,
     #   review_score_avg, refund_amount_sum
     comparison: str | None = Field(None, description="对比维度：month_over_month / year_over_year")
@@ -238,6 +239,9 @@ def extract_query_params(question: str) -> QueryParams:
     策略：规则先行 → LLM 增强 → 规则关键字兜底。避免 LLM 把"退款率"误判为 top_refund_products。
     """
     rule_params = _extract_params_by_rules(question)
+    slots = extract_intent_slots(question)
+    if slots.metric and slots.confidence >= 0.9:
+        return rule_params
     try:
         llm_params = _extract_params_with_llm(question)
     except Exception as exc:
@@ -245,25 +249,13 @@ def extract_query_params(question: str) -> QueryParams:
         return rule_params
 
     # ── 规则校准：如果问题中明确提到了指标关键词，规则优先 ──
-    _metric_keywords: dict[str, list[str]] = {
-        "ticket_distribution": ["工单", "客服", "投诉原因", "售后原因"],
-        "top_refund_products": ["排行", "退款最多", "退款最高的商品", "top"],
-        "review_score_avg": ["评分", "好评", "差评", "星级", "平均分"],
-        "refund_amount_sum": ["退款金额", "退款总额", "总金额", "退了多少"],
-        "refund_count": ["退款数", "退款单数", "退款笔数"],
-        "order_count": ["订单数", "订单量", "销量", "卖了多少"],
-        "refund_rate": ["退款率"],
-    }
-    # 找到问题中明确提到的指标 → 覆盖 LLM
-    for metric, keywords in _metric_keywords.items():
-        if any(kw in question for kw in keywords):
-            if llm_params.metric != metric:
-                logger.info(
-                    "Param extraction: overriding LLM metric %s → %s (question keyword match)",
-                    llm_params.metric, metric,
-                )
-                llm_params.metric = metric
-            break
+    if slots.metric and llm_params.metric != slots.metric:
+        logger.info(
+            "Param extraction: overriding LLM metric %s → %s (intent slots)",
+            llm_params.metric,
+            slots.metric,
+        )
+        llm_params.metric = slots.metric
 
     # 时间范围：LLM 通常更准确（处理"上个月"等），但如果 LLM 没抽到则用规则结果
     if not llm_params.time_range:
@@ -291,6 +283,7 @@ def _extract_params_with_llm(question: str) -> QueryParams:
 - refund_count: 退款数量
 - order_count: 订单数量
 - ticket_distribution: 工单原因分布
+- ticket_count: 工单数量
 - top_refund_products: 退款最多的商品
 - review_score_avg: 平均评分
 - refund_amount_sum: 退款总金额
@@ -330,60 +323,15 @@ comparison：month_over_month（环比）、year_over_year（同比）、null。
 
 def _extract_params_by_rules(question: str) -> QueryParams:
     """规则兜底：当 LLM 参数抽取失败时使用。"""
-    params = QueryParams()
-
-    # ── 时间范围 ──
-    time_patterns: list[tuple[str, Any]] = [
-        (r"(\d{1,2})月", lambda m: f"2026-{int(m.group(1)):02d}"),
-        (r"上个?月", lambda _: "2026-03"),
-        (r"上上个?月", lambda _: "2026-02"),
-        (r"(Q[1-4])", lambda m: f"2026-{m.group(1)}"),
-        (r"第([一二三四])季度", lambda m: f"2026-Q{['一','二','三','四'].index(m.group(1))+1}"),
-    ]
-    for pattern, resolver in time_patterns:
-        match = re.search(pattern, question)
-        if match:
-            params.time_range = resolver(match)
-            break
-    if not params.time_range:
-        params.time_range = "2026-04"  # 默认
-
-    # ── 品类（支持别名）──
-    category_aliases: dict[str, list[str]] = {
-        "服装": ["服装", "衣服", "T恤", "裤子", "裙子", "外套", "衬衫"],
-        "鞋靴": ["鞋靴", "鞋", "鞋子", "靴子", "运动鞋", "皮鞋", "凉鞋"],
-        "数码": ["数码", "手机", "耳机", "手表", "平板", "电脑", "音箱", "手机壳"],
-    }
-    for canonical, aliases in category_aliases.items():
-        if any(alias in question for alias in aliases):
-            params.category = canonical
-            break
-
-    # ── 指标 ──
-    if any(kw in question for kw in ["工单", "客服", "投诉原因", "售后原因"]):
-        params.metric = "ticket_distribution"
-    elif any(kw in question for kw in ["排行", "top", "最高", "最多"]):
-        params.metric = "top_refund_products"
-    elif any(kw in question for kw in ["评分", "好评", "差评", "星级", "平均分"]):
-        params.metric = "review_score_avg"
-    elif any(kw in question for kw in ["退款金额", "退款总额", "总金额", "退了多少"]):
-        params.metric = "refund_amount_sum"
-    elif any(kw in question for kw in ["退款数", "退款单数", "退款笔数"]):
-        params.metric = "refund_count"
-    elif any(kw in question for kw in ["订单数", "订单量", "销量", "卖了多少"]):
-        params.metric = "order_count"
-    # 默认 refund_rate
-
-    # ── 对比 ──
-    if any(kw in question for kw in ["环比", "对比上月", "和上个月", "上月"]):
-        params.comparison = "month_over_month"
-    elif any(kw in question for kw in ["同比", "去年同期", "和去年"]):
-        params.comparison = "year_over_year"
-    elif any(kw in question for kw in ["升高", "降低", "下降", "增加", "减少", "为什么"]):
-        # "为什么升高/降低" — 需要对比数据才能回答
-        params.comparison = "month_over_month"
-
-    return params
+    slots = extract_intent_slots(question)
+    return QueryParams(
+        time_range=slots.time_range or "2026-04",
+        category=slots.category,
+        metric=slots.metric or "refund_rate",
+        comparison=slots.comparison,
+        sort_order="desc",
+        limit=10,
+    )
 
 
 # ── SQL 错误分类 ─────────────────────────────────────────────────────

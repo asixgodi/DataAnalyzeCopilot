@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     collection_name: str = "after_sales_knowledge"
 
     database_url: str = "sqlite:///../../data/demo.db"
+    checkpoint_database_path: str = "../../data/checkpoints.db"
+    trace_database_path: str = "../../data/traces.db"
     documents_dir: str = "../../data/documents"
     chunk_strategy: str = "markdown_heading"
     chunk_size: int = 800

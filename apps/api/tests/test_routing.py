@@ -42,3 +42,13 @@ def test_route_confidence_range():
         assert 0 <= confidence <= 1
         assert isinstance(reason, str)
         assert len(reason) > 0
+
+
+def test_product_policy_is_rag_not_hybrid():
+    route, _, _ = route_question("商品退款政策是什么？")
+    assert route == "rag"
+
+
+def test_complete_question_with_look_is_not_clarification():
+    route, _, _ = route_question("帮我看看4月服装退款率")
+    assert route == "sql"
