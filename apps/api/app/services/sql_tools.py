@@ -1,9 +1,15 @@
+import logging
 import re
 import sqlite3
 from typing import Any
 
+import sqlparse
+from pydantic import BaseModel, Field
+
 from app.schemas.chat import SqlResult
 from app.services.data_store import get_connection
+
+logger = logging.getLogger(__name__)
 
 
 BLOCKED_SQL = re.compile(r"\b(drop|delete|update|insert|alter|truncate|replace|create)\b", re.I)
@@ -161,3 +167,245 @@ def build_sql_for_question(question: str) -> str:
     WHERE o.month = '{month}' AND p.category = '{category}'
     GROUP BY p.category, o.month
     """
+
+
+# ── SQL 安全校验 v2 (sqlparse AST) ───────────────────────────────────
+
+
+def validate_readonly_sql_v2(sql: str) -> None:
+    """
+    基于 sqlparse AST 的 SQL 安全校验。
+
+    相比 validate_readonly_sql（正则 + 首词检查），
+    sqlparse 能正确解析多语句、嵌套子查询、注释等，
+    防止 SELECT...; DROP TABLE orders-- 这种绕过。
+    """
+    statements = sqlparse.parse(sql)
+
+    if len(statements) == 0:
+        raise ValueError("SQL 为空。")
+
+    if len(statements) > 1:
+        raise ValueError(f"SQL 包含 {len(statements)} 条语句，只允许单条 SELECT。")
+
+    stmt = statements[0]
+    stmt_type = stmt.get_type()
+
+    if stmt_type not in ("SELECT", "UNKNOWN"):
+        raise ValueError(f"不允许的 SQL 类型：{stmt_type}，只允许 SELECT。")
+
+    # 遍历 token 检查危险关键字
+    dangerous_tokens = {
+        "DROP", "DELETE", "UPDATE", "INSERT", "ALTER",
+        "TRUNCATE", "CREATE", "REPLACE", "ATTACH", "DETACH",
+    }
+    for token in stmt.flatten():
+        if token.ttype in (
+            sqlparse.tokens.Keyword,
+            sqlparse.tokens.Keyword.DDL,
+            sqlparse.tokens.Keyword.DML,
+        ):
+            if token.normalized.upper() in dangerous_tokens:
+                raise ValueError(f"SQL 包含危险关键字：{token.normalized}")
+
+
+# ── QueryParams — 结构化查询参数 ──────────────────────────────────────
+
+
+class QueryParams(BaseModel):
+    """从用户问题中抽取的结构化查询参数。"""
+
+    time_range: str | None = Field(None, description="时间范围，如 2026-04")
+    category: str | None = Field(None, description="商品类目：服装/鞋靴/数码")
+    metric: str = Field("refund_rate", description="指标类型")
+    # 可选 metric：
+    #   refund_rate, refund_count, order_count,
+    #   ticket_distribution, top_refund_products,
+    #   review_score_avg, refund_amount_sum
+    comparison: str | None = Field(None, description="对比维度：month_over_month / year_over_year")
+    sort_by: str | None = Field(None, description="排序字段")
+    sort_order: str = Field("desc", description="排序方向：asc / desc")
+    limit: int = Field(10, description="返回行数限制")
+
+
+# ── 参数抽取 ─────────────────────────────────────────────────────────
+
+
+def extract_query_params(question: str) -> QueryParams:
+    """
+    从自然语言中抽取结构化查询参数。
+
+    策略：规则先行 → LLM 增强 → 规则关键字兜底。避免 LLM 把"退款率"误判为 top_refund_products。
+    """
+    rule_params = _extract_params_by_rules(question)
+    try:
+        llm_params = _extract_params_with_llm(question)
+    except Exception as exc:
+        logger.warning("LLM param extraction failed (%s), using rules", exc)
+        return rule_params
+
+    # ── 规则校准：如果问题中明确提到了指标关键词，规则优先 ──
+    _metric_keywords: dict[str, list[str]] = {
+        "ticket_distribution": ["工单", "客服", "投诉原因", "售后原因"],
+        "top_refund_products": ["排行", "退款最多", "退款最高的商品", "top"],
+        "review_score_avg": ["评分", "好评", "差评", "星级", "平均分"],
+        "refund_amount_sum": ["退款金额", "退款总额", "总金额", "退了多少"],
+        "refund_count": ["退款数", "退款单数", "退款笔数"],
+        "order_count": ["订单数", "订单量", "销量", "卖了多少"],
+        "refund_rate": ["退款率"],
+    }
+    # 找到问题中明确提到的指标 → 覆盖 LLM
+    for metric, keywords in _metric_keywords.items():
+        if any(kw in question for kw in keywords):
+            if llm_params.metric != metric:
+                logger.info(
+                    "Param extraction: overriding LLM metric %s → %s (question keyword match)",
+                    llm_params.metric, metric,
+                )
+                llm_params.metric = metric
+            break
+
+    # 时间范围：LLM 通常更准确（处理"上个月"等），但如果 LLM 没抽到则用规则结果
+    if not llm_params.time_range:
+        llm_params.time_range = rule_params.time_range
+    # 品类：规则更可靠
+    if not llm_params.category:
+        llm_params.category = rule_params.category
+    # 对比：合并（规则+LLM）
+    if rule_params.comparison and not llm_params.comparison:
+        llm_params.comparison = rule_params.comparison
+
+    return llm_params
+
+
+def _extract_params_with_llm(question: str) -> QueryParams:
+    """LLM 参数抽取（依赖 llm_client，避免循环导入延迟导入）。"""
+    import json as _json
+
+    from app.services.llm_client import get_llm_client
+
+    prompt = f"""从用户问题中抽取查询参数，只输出 JSON。
+
+可选 metric 值：
+- refund_rate: 退款率
+- refund_count: 退款数量
+- order_count: 订单数量
+- ticket_distribution: 工单原因分布
+- top_refund_products: 退款最多的商品
+- review_score_avg: 平均评分
+- refund_amount_sum: 退款总金额
+
+time_range 格式：YYYY-MM（如 2026-04）；未提到时间则为 null。
+category：服装、鞋靴、数码；未提到则为 null。
+comparison：month_over_month（环比）、year_over_year（同比）、null。
+
+用户问题：{question}
+
+输出 JSON：{{"time_range":null,"category":null,"metric":"refund_rate","comparison":null,"sort_by":null,"sort_order":"desc","limit":10}}"""
+
+    client = get_llm_client()
+    text, _ = client.call(
+        [{"role": "user", "content": prompt}],
+        purpose="param_extract",
+        temperature=0,
+        max_tokens=240,
+        response_format={"type": "json_object"},
+    )
+
+    # 解析 JSON
+    cleaned = text.strip()
+    if "```" in cleaned:
+        parts = cleaned.split("```")
+        cleaned = next((p for p in parts if "{" in p and "}" in p), cleaned)
+        cleaned = cleaned.replace("json", "", 1).strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start < 0 or end < start:
+        raise ValueError("LLM did not return JSON object")
+    data = _json.loads(cleaned[start : end + 1])
+
+    data = {k: v for k, v in data.items() if k in QueryParams.model_fields and v is not None}
+    return QueryParams(**data)
+
+
+def _extract_params_by_rules(question: str) -> QueryParams:
+    """规则兜底：当 LLM 参数抽取失败时使用。"""
+    params = QueryParams()
+
+    # ── 时间范围 ──
+    time_patterns: list[tuple[str, Any]] = [
+        (r"(\d{1,2})月", lambda m: f"2026-{int(m.group(1)):02d}"),
+        (r"上个?月", lambda _: "2026-03"),
+        (r"上上个?月", lambda _: "2026-02"),
+        (r"(Q[1-4])", lambda m: f"2026-{m.group(1)}"),
+        (r"第([一二三四])季度", lambda m: f"2026-Q{['一','二','三','四'].index(m.group(1))+1}"),
+    ]
+    for pattern, resolver in time_patterns:
+        match = re.search(pattern, question)
+        if match:
+            params.time_range = resolver(match)
+            break
+    if not params.time_range:
+        params.time_range = "2026-04"  # 默认
+
+    # ── 品类（支持别名）──
+    category_aliases: dict[str, list[str]] = {
+        "服装": ["服装", "衣服", "T恤", "裤子", "裙子", "外套", "衬衫"],
+        "鞋靴": ["鞋靴", "鞋", "鞋子", "靴子", "运动鞋", "皮鞋", "凉鞋"],
+        "数码": ["数码", "手机", "耳机", "手表", "平板", "电脑", "音箱", "手机壳"],
+    }
+    for canonical, aliases in category_aliases.items():
+        if any(alias in question for alias in aliases):
+            params.category = canonical
+            break
+
+    # ── 指标 ──
+    if any(kw in question for kw in ["工单", "客服", "投诉原因", "售后原因"]):
+        params.metric = "ticket_distribution"
+    elif any(kw in question for kw in ["排行", "top", "最高", "最多"]):
+        params.metric = "top_refund_products"
+    elif any(kw in question for kw in ["评分", "好评", "差评", "星级", "平均分"]):
+        params.metric = "review_score_avg"
+    elif any(kw in question for kw in ["退款金额", "退款总额", "总金额", "退了多少"]):
+        params.metric = "refund_amount_sum"
+    elif any(kw in question for kw in ["退款数", "退款单数", "退款笔数"]):
+        params.metric = "refund_count"
+    elif any(kw in question for kw in ["订单数", "订单量", "销量", "卖了多少"]):
+        params.metric = "order_count"
+    # 默认 refund_rate
+
+    # ── 对比 ──
+    if any(kw in question for kw in ["环比", "对比上月", "和上个月", "上月"]):
+        params.comparison = "month_over_month"
+    elif any(kw in question for kw in ["同比", "去年同期", "和去年"]):
+        params.comparison = "year_over_year"
+    elif any(kw in question for kw in ["升高", "降低", "下降", "增加", "减少", "为什么"]):
+        # "为什么升高/降低" — 需要对比数据才能回答
+        params.comparison = "month_over_month"
+
+    return params
+
+
+# ── SQL 错误分类 ─────────────────────────────────────────────────────
+
+
+def classify_sql_error(error: str) -> str:
+    """
+    SQL 执行错误分类，用于结构化 Reflect。
+
+    Returns:
+        no_such_column | no_such_table | ambiguous_column |
+        syntax | type_mismatch | unknown
+    """
+    error_lower = error.lower()
+    if "no such column" in error_lower:
+        return "no_such_column"
+    if "no such table" in error_lower:
+        return "no_such_table"
+    if "ambiguous column" in error_lower:
+        return "ambiguous_column"
+    if "near" in error_lower or "syntax" in error_lower:
+        return "syntax"
+    if "datatype" in error_lower or "type mismatch" in error_lower:
+        return "type_mismatch"
+    return "unknown"

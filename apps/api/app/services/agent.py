@@ -9,6 +9,11 @@ StateGraph 结构:
     → clarification → generate_final → END
 
 SQL 分支含失败重试（reflect → generate 循环，默认最多 2 次）。
+
+v2 升级：
+  - LLM Router: few-shot examples + 多轮上下文 + 置信度校准
+  - Text2SQL: LLM 参数抽取 + 参数化模板库 + sqlparse AST 校验
+  - Harness: Input/Output Guard + LLM Client 统一调用 + 结构化日志 + 全局超时
 """
 
 import json
@@ -33,6 +38,8 @@ from app.schemas.chat import (
     Metrics,
     SqlResult,
 )
+from app.services.guards import InputGuard, OutputGuard
+from app.services.llm_client import LLMClient, get_llm_client
 from app.services.memory import (
     PromptContext,
     build_context,
@@ -42,14 +49,19 @@ from app.services.memory import (
     update_memory,
 )
 from app.services.rag import retrieve_docs
+from app.services.sql_templates import build_sql_from_params
 from app.services.sql_tools import (
+    QueryParams,
     analyze_sql_risk,
     build_sql_for_question,
+    classify_sql_error,
     execute_readonly_sql,
+    extract_query_params,
     get_table_schema,
     list_tables,
     validate_readonly_sql,
 )
+from app.services.structured_log import slog
 from app.services.trace import TraceRecorder
 
 logger = logging.getLogger(__name__)
@@ -59,6 +71,8 @@ ROUTE_SQL = "sql"
 ROUTE_RAG = "rag"
 ROUTE_HYBRID = "hybrid"
 ROUTE_CLARIFY = "clarification"
+
+GLOBAL_TIMEOUT_SECONDS = 60
 
 
 # ── State ────────────────────────────────────────────────────────────
@@ -149,18 +163,15 @@ def _generate_sql_with_llm(
     schema_text = "\n\n".join(schema_parts)
     ctx = prompt_ctx or {}
 
-    # ═══════════════════════════════════════
-    # 按 6 层结构组装 messages
-    # ═══════════════════════════════════════
     messages: list[dict[str, str]] = []
 
-    # ① system prompt — Agent 角色定义
+    # ① system prompt
     messages.append({
         "role": "system",
         "content": ctx.get("system_prompt", get_instruction()),
     })
 
-    # ② 业务指令 — 分析规范 + 输出格式
+    # ② 业务指令
     messages.append({
         "role": "system",
         "content": ctx.get("business_instructions", ""),
@@ -173,7 +184,7 @@ def _generate_sql_with_llm(
             "content": ctx["user_profile_text"],
         })
 
-    # ④ conversation (最近对话) — 最近 4 轮完整对话
+    # ④ conversation (最近对话)
     recent_turns: list[dict[str, str]] = ctx.get("recent_turns", [])
     for turn in recent_turns[-4:]:
         messages.append({"role": "user", "content": turn["user"]})
@@ -201,27 +212,11 @@ def _generate_sql_with_llm(
         ),
     })
 
-    headers = {
-        "Authorization": f"Bearer {settings.siliconflow_api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": settings.llm_model,
-        "messages": messages,
-        "temperature": 0.1,
-        "max_tokens": 600,
-    }
-
-    with httpx.Client() as client:
-        resp = client.post(
-            f"{settings.llm_base_url.rstrip('/')}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=45.0,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        sql = data["choices"][0]["message"]["content"].strip()
+    # 使用统一 LLM Client（内置重试 + 记录）
+    client = get_llm_client()
+    sql, record = client.call(
+        messages, purpose="sql_gen", temperature=0.1, max_tokens=600,
+    )
 
     for fence in ("```sql", "```"):
         if fence in sql:
@@ -237,12 +232,42 @@ def _generate_sql_with_llm(
     return sql
 
 
+def _generate_sql_v2(
+    question: str,
+    prompt_ctx: PromptContext | None = None,
+    tool_error: str | None = None,
+) -> str:
+    """SQL 生成 v2: LLM 参数抽取 → 参数化模板 → LLM 全量生成 → 旧模板兜底"""
+    # Phase 1: 参数抽取
+    try:
+        params = extract_query_params(question)
+    except Exception:
+        params = QueryParams(time_range="2026-04")
+
+    # Phase 2: 模板匹配
+    template_sql = build_sql_from_params(params)
+    if template_sql:
+        return template_sql
+
+    # Phase 3: LLM 全量生成
+    if settings.siliconflow_api_key:
+        tables = list_tables()
+        try:
+            sql = _generate_sql_with_llm(question, tables, prompt_ctx, tool_error)
+            return sql
+        except Exception as exc:
+            logger.warning("LLM SQL generation failed: %s", exc)
+
+    # Phase 4: 旧模板兜底
+    return build_sql_for_question(question)
+
+
 def _generate_sql(
     question: str,
     prompt_ctx: PromptContext | None = None,
     tool_error: str | None = None,
 ) -> str:
-    """生成 SQL：优先使用模板匹配，复杂问题回退到 LLM。"""
+    """生成 SQL：优先使用模板匹配，复杂问题回退到 LLM。（保留旧接口兼容）"""
     template_sql = build_sql_for_question(question)
 
     default_patterns = ["refund_rate", "COUNT(DISTINCT r.id)"]
@@ -355,52 +380,85 @@ def _classify_question_with_llm(
     rule_route: str,
     rule_reason: str,
     rule_confidence: float,
+    recent_turns: list[dict[str, str]] | None = None,
 ) -> tuple[str, str, float]:
+    # 构建 few-shot examples
+    few_shot_examples = """
+示例1：
+用户问题：4月服装类退款率是多少
+输出：{"route":"sql","confidence":0.95,"reason":"查询具体月份的退款率数据，属于结构化数据查询。"}
+
+示例2：
+用户问题：退款率超过多少会触发品控审核
+输出：{"route":"rag","confidence":0.92,"reason":"询问触发品控审核的规则阈值，属于业务规则查询。"}
+
+示例3：
+用户问题：结合4月数据和退款政策分析退款率为什么升高
+输出：{"route":"hybrid","confidence":0.93,"reason":"需要同时查数据库和知识库进行归因分析。"}
+
+示例4：
+用户问题：退款率
+输出：{"route":"clarification","confidence":0.85,"reason":"问题缺少时间范围和类目信息，需要追问。"}
+
+示例5：
+用户问题：查询5月各品类的退款订单数排行
+输出：{"route":"sql","confidence":0.94,"reason":"查询具体月份的退款订单排行，属于结构化数据查询。"}
+
+示例6：
+用户问题：售后SOP中对于色差问题的处理流程是什么
+输出：{"route":"rag","confidence":0.93,"reason":"询问SOP处理流程，属于知识库文档查询。"}
+
+示例7：
+用户问题：5月服装退款率升高是否与退货政策调整有关
+输出：{"route":"hybrid","confidence":0.91,"reason":"需要查退款率数据并检索退货政策文档来综合分析。"}
+
+示例8：
+用户问题：帮我看看
+输出：{"route":"clarification","confidence":0.88,"reason":"问题信息不足，缺少具体分析方向，需要追问。"}
+"""
+
+    # 构建最近对话上下文
+    recent_context = ""
+    if recent_turns:
+        recent_lines = []
+        for turn in recent_turns[-3:]:
+            recent_lines.append(f"用户：{turn.get('user', '')}")
+            recent_lines.append(f"助手：{turn.get('assistant', '')[:200]}")
+        recent_context = "\n".join(recent_lines)
+
     prompt = f"""你是企业售后 Agent 的意图路由器，只负责选择工具链，不直接回答用户。
 
 可选 route：
 - sql：需要查询结构化数据库，例如退款率、订单数、退款数、排行榜、具体统计。
 - rag：需要查询知识库文档，例如政策、SOP、规则、流程、口径定义、应该触发什么处理。
-- hybrid：需要同时查数据库和知识库，例如“结合4月数据和退款政策分析为什么升高”。
+- hybrid：需要同时查数据库和知识库，例如"结合4月数据和退款政策分析为什么升高"。
 - clarification：问题缺少关键条件，需要先追问。
 
 判断要求：
-- “应该/触发/流程/规则/怎么处理/如何判断/SOP”通常是 rag，除非用户明确要查真实数据。
-- “多少/退款率/订单数/退款数/排名/top/统计/查询”通常是 sql。
-- “结合数据和政策/为什么升高/归因分析”通常是 hybrid。
+- "应该/触发/流程/规则/怎么处理/如何判断/SOP"通常是 rag，除非用户明确要查真实数据。
+- "多少/退款率/订单数/退款数/排名/top/统计/查询"通常是 sql。
+- "结合数据和政策/为什么升高/归因分析"通常是 hybrid。
 - 只能输出 JSON，不要输出解释文字。
+
+{few_shot_examples}
 
 规则路由初判：
 route={rule_route}
 reason={rule_reason}
 confidence={rule_confidence}
 
-用户问题：
+{f"最近对话上下文：{chr(10)}{recent_context}{chr(10)}" if recent_context else ""}用户问题：
 {question}
 
 输出格式：
 {{"route":"sql|rag|hybrid|clarification","confidence":0.0,"reason":"一句中文原因"}}"""
 
-    headers = {
-        "Authorization": f"Bearer {settings.siliconflow_api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": settings.llm_model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
-        "max_tokens": 240,
-        "response_format": {"type": "json_object"},
-    }
-    with httpx.Client() as client:
-        resp = client.post(
-            f"{settings.llm_base_url.rstrip('/')}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=20.0,
-        )
-        resp.raise_for_status()
-        data = _extract_json_object(resp.json()["choices"][0]["message"]["content"])
+    client = get_llm_client()
+    text, _ = client.call(
+        [{"role": "user", "content": prompt}],
+        purpose="router", temperature=0, max_tokens=240,
+    )
+    data = _extract_json_object(text)
 
     route = str(data.get("route", "")).lower()
     if route not in {ROUTE_SQL, ROUTE_RAG, ROUTE_HYBRID, ROUTE_CLARIFY}:
@@ -411,15 +469,44 @@ confidence={rule_confidence}
     return route, f"LLM Router：{reason}", confidence
 
 
-def _classify_question(question: str) -> tuple[str, str, float]:
+def _classify_question(
+    question: str,
+    recent_turns: list[dict[str, str]] | None = None,
+) -> tuple[str, str, float]:
     rule_route, rule_reason, rule_confidence = route_question(question)
     if not _should_use_llm_router(question, rule_route, rule_confidence):
         return rule_route, rule_reason, rule_confidence
     try:
-        return _classify_question_with_llm(question, rule_route, rule_reason, rule_confidence)
+        llm_route, llm_reason, llm_confidence = _classify_question_with_llm(
+            question, rule_route, rule_reason, rule_confidence,
+            recent_turns=recent_turns,
+        )
     except Exception as exc:
         logger.warning("LLM Router failed (%s), using rule route", exc)
         return rule_route, f"{rule_reason}（LLM Router 失败，已回退规则路由）", rule_confidence
+
+    # ── 安全网：明确包含数据+文档关键词的"为什么/分析"类问题，强制 hybrid ──
+    _why_data_doc_keywords = ["为什么", "原因", "结合.*数据.*政策", "结合.*政策.*数据"]
+    _data_kw = ["退款率", "退款数", "订单数", "工单", "金额", "销量", "排行", "统计"]
+    _doc_kw = ["政策", "流程", "规则", "SOP", "sop", "口径", "定义"]
+    has_why = any(kw in question for kw in _why_data_doc_keywords) or any(
+        kw in question for kw in ["结合", "分析"]
+    )
+    has_data_term = any(kw in question for kw in _data_kw)
+    has_doc_term = any(kw in question for kw in _doc_kw)
+
+    if llm_route == ROUTE_SQL and has_why and has_data_term and has_doc_term:
+        logger.warning(
+            "LLM Router returned sql for why+data+doc question, forcing hybrid. "
+            "Question keywords: why=%s data=%s doc=%s",
+            has_why, has_data_term, has_doc_term,
+        )
+        return ROUTE_HYBRID, (
+            f"LLM Router 返回 sql，但问题同时包含数据与政策关键词，"
+            f"已强制切换至 hybrid 以提供综合分析。"
+        ), max(llm_confidence, 0.88)
+
+    return llm_route, llm_reason, llm_confidence
 
 
 def _is_policy_or_flow_question(question: str) -> bool:
@@ -541,7 +628,8 @@ def _stringify_user_profile(profile: dict[str, Any]) -> dict[str, str]:
 def classify_intent_node(state: dict[str, Any]) -> dict[str, Any]:
     if state.get("route"):
         return state
-    route, reason, confidence = _classify_question(state["question"])
+    recent = state.get("prompt_ctx", {}).get("recent_turns", [])
+    route, reason, confidence = _classify_question(state["question"], recent_turns=recent)
     return _update(state, route=route, route_reason=reason, route_confidence=confidence)
 
 
@@ -566,7 +654,7 @@ def sql_generate_node(state: dict[str, Any]) -> dict[str, Any]:
             f"请修正 SQL 并重新生成。"
         )
     try:
-        sql = _generate_sql(
+        sql = _generate_sql_v2(
             question,
             prompt_ctx=state.get("prompt_ctx"),
             tool_error=state.get("sql_error") if state.get("sql_retry_count", 0) > 0 else None,
@@ -653,10 +741,27 @@ def sql_check_condition(state: dict[str, Any]) -> Literal["retry", "format"]:
 
 
 def sql_reflect_node(state: dict[str, Any]) -> dict[str, Any]:
-    return _update(
-        state,
-        sql_retry_count=state.get("sql_retry_count", 0) + 1,
+    error = state.get("sql_error", "")
+    failed_sql = state.get("sql", "")
+    retry_count = state.get("sql_retry_count", 0)
+    error_type = classify_sql_error(error)
+    hints = {
+        "no_such_column": "请检查列名是否正确。可用列名请参考 CREATE TABLE 定义。",
+        "no_such_table": "请检查表名。可用表：products, orders, refunds, reviews, tickets。",
+        "ambiguous_column": "列名在多表中存在，请用 表名.列名 限定。",
+        "syntax": "请检查 SQL 语法：表名/列名拼写、括号匹配、逗号位置。",
+        "type_mismatch": "请检查比较值的类型是否匹配列类型。",
+        "unknown": "请仔细检查 SQL 逻辑和语法。",
+    }
+    reflect_prompt = (
+        f"原始问题：{state['question']}\n"
+        f"第 {retry_count} 次生成的 SQL：\n{failed_sql}\n"
+        f"执行错误类型：{error_type}\n"
+        f"错误详情：{error}\n"
+        f"修复提示：{hints.get(error_type, hints['unknown'])}\n"
+        f"请修正 SQL 并重新生成。"
     )
+    return _update(state, sql_retry_count=retry_count + 1, sql_error=reflect_prompt)
 
 
 def format_sql_answer_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -742,7 +847,7 @@ def hybrid_run_node(state: dict[str, Any]) -> dict[str, Any]:
     updates: dict[str, Any] = {}
 
     try:
-        sql = _generate_sql(question, prompt_ctx=state.get("prompt_ctx"))
+        sql = _generate_sql_v2(question, prompt_ctx=state.get("prompt_ctx"))
     except Exception:
         sql = build_sql_for_question(question)
     updates["sql"] = sql
@@ -792,21 +897,45 @@ def _build_hybrid_evidence(state: dict[str, Any]) -> tuple[list[str], str, str]:
     if error:
         parts.append(f"数据查询遇到问题：{error}")
     elif rows:
-        row = rows[0]
-        if "refund_rate" in row:
-            parts.append(
-                f"数据结果：{row.get('month', '')} {row.get('category', '')}类目 "
-                f"退款率为 {row['refund_rate']}%（订单 {row.get('order_count', '?')} 单，"
-                f"退款 {row.get('refund_count', '?')} 单）。"
-            )
-        elif "ticket_count" in row:
-            detail = "，".join(
-                f"{item.get('reason', '?')} {item['ticket_count']} 次"
-                for item in rows
-            )
-            parts.append(f"数据结果：工单原因分布——{detail}。")
+        # ── 对比数据（环比/同比）— 尝试区分 current/previous 两期 ──
+        has_period_col = "period" in rows[0] if rows else False
+        if has_period_col and len(rows) >= 2:
+            current_row = next((r for r in rows if r.get("period") == "current"), rows[0])
+            prev_row = next((r for r in rows if r.get("period") == "previous"), rows[1])
+            if "refund_rate" in current_row:
+                cur_rate = current_row.get("refund_rate", "?")
+                prev_rate = prev_row.get("refund_rate", "?")
+                category = current_row.get("category") or prev_row.get("category", "?")
+                change = ""
+                try:
+                    diff = float(cur_rate) - float(prev_rate)
+                    direction = "升高" if diff > 0 else ("下降" if diff < 0 else "持平")
+                    change = f"，环比{direction} {abs(diff):.2f} 个百分点"
+                except (ValueError, TypeError):
+                    pass
+                parts.append(
+                    f"数据结果：{category}类目当月退款率 {cur_rate}%（上月 {prev_rate}%{change}），"
+                    f"当月订单 {current_row.get('order_count', '?')} 单、"
+                    f"退款 {current_row.get('refund_count', '?')} 单。"
+                )
+            else:
+                parts.append(f"数据结果：查询返回 {state.get('sql_row_count', 0)} 行（含环比对比）。")
         else:
-            parts.append(f"数据结果：查询返回 {state.get('sql_row_count', 0)} 行。")
+            row = rows[0]
+            if "refund_rate" in row:
+                parts.append(
+                    f"数据结果：{row.get('month', '')} {row.get('category', '')}类目 "
+                    f"退款率为 {row['refund_rate']}%（订单 {row.get('order_count', '?')} 单，"
+                    f"退款 {row.get('refund_count', '?')} 单）。"
+                )
+            elif "ticket_count" in row:
+                detail = "，".join(
+                    f"{item.get('reason', '?')} {item['ticket_count']} 次"
+                    for item in rows
+                )
+                parts.append(f"数据结果：工单原因分布——{detail}。")
+            else:
+                parts.append(f"数据结果：查询返回 {state.get('sql_row_count', 0)} 行。")
     else:
         parts.append("数据结果：未查到匹配记录。")
 
@@ -839,7 +968,7 @@ def _generate_hybrid_answer_with_llm(state: dict[str, Any], sql_evidence: str, d
 
 要求：
 - 只能使用给定的 SQL 结果和文档证据，不要编造额外数据。
-- 如果 SQL 结果没有退款原因分布、SKU 分布、活动渠道等信息，必须明确说明“当前数据不足，不能直接断定具体原因”。
+- 如果 SQL 结果没有退款原因分布、SKU 分布、活动渠道等信息，必须明确说明"当前数据不足，不能直接断定具体原因"。
 - 回答要包含：数据异常判断、可能原因、文档依据、还缺少哪些数据、下一步建议。
 - 不要输出 JSON，不要输出 Markdown 表格。
 
@@ -853,26 +982,12 @@ SQL 结果：
 {doc_evidence}
 """
 
-    headers = {
-        "Authorization": f"Bearer {settings.siliconflow_api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": settings.llm_model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,
-        "max_tokens": 900,
-    }
-
-    with httpx.Client() as client:
-        resp = client.post(
-            f"{settings.llm_base_url.rstrip('/')}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=45.0,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+    client = get_llm_client()
+    text, _ = client.call(
+        [{"role": "user", "content": prompt}],
+        purpose="hybrid_synthesis", temperature=0.2, max_tokens=900,
+    )
+    return text
 
 
 def hybrid_merge_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -968,7 +1083,7 @@ def build_graph() -> StateGraph:
     workflow.add_node("sql_retrieve_schema", sql_retrieve_schema_node)
     workflow.add_node("sql_generate", sql_generate_node)
     workflow.add_node("sql_validate", sql_validate_node)
-    # 风险检查、触发 HITL 挂起（真正 interrupt）
+    # 风险检查、触发 HITL 审批（真正 interrupt）
     workflow.add_node("sql_risk_check", sql_risk_check_node)
     workflow.add_node("sql_execute", sql_execute_node)
     workflow.add_node("sql_reflect", sql_reflect_node)
@@ -1091,8 +1206,42 @@ def run_agent(request: ChatRequest) -> ChatResponse:
     started = perf_counter()
     session_id = request.session_id or f"session_{uuid4().hex[:8]}"
     memory = get_memory(session_id)
-    question = resolve_followup(request.message.strip(), memory)
     trace = TraceRecorder()
+
+    # ── Input Guard: 输入安全检查 ──
+    input_guard = InputGuard()
+    guard_result = input_guard.check(request.message)
+    if not guard_result.passed:
+        slog.warning("input_guard_rejected", session_id=session_id, reason=guard_result.reason)
+        latency_ms = round((perf_counter() - started) * 1000, 2)
+        return ChatResponse(
+            answer=guard_result.reason or "抱歉，您的输入包含不合规内容，请重新描述您的问题。",
+            route=ROUTE_CLARIFY,
+            trace_id=trace.trace_id,
+            steps=trace.steps,
+            citations=[],
+            sql_result=None,
+            metrics=Metrics(
+                latency_ms=latency_ms,
+                tool_calls=0,
+                citations=0,
+                route_confidence=0.0,
+            ),
+            memory=MemoryInfo(
+                session_id=session_id,
+                recent_turns=len(memory.recent_turns),
+                conversation_summary=memory.conversation_summary,
+                user_profile=_stringify_user_profile(memory.user_profile),
+            ),
+            requires_approval=False,
+            approval_context=None,
+        )
+    request_message = guard_result.sanitized_input or request.message
+
+    question = resolve_followup(request_message.strip(), memory)
+
+    # ── 结构化日志 trace ──
+    slog.set_trace(trace.trace_id)
 
     trace.add(
         "receive_message",
@@ -1102,7 +1251,12 @@ def run_agent(request: ChatRequest) -> ChatResponse:
         metadata={"session_id": session_id, "resolved_question": question},
     )
 
-    route, reason, confidence = _classify_question(question)
+    # 构建结构化 PromptContext
+    prompt_ctx = build_context(memory)
+
+    # 从 prompt_ctx 获取 recent_turns 传递给路由分类
+    recent_turns = prompt_ctx.get("recent_turns", [])
+    route, reason, confidence = _classify_question(question, recent_turns=recent_turns)
     trace.add(
         "classify_intent",
         "RouterAgent",
@@ -1111,11 +1265,35 @@ def run_agent(request: ChatRequest) -> ChatResponse:
         metadata={"route": route, "confidence": confidence},
     )
 
+    # ── 全局超时检查 ──
+    if perf_counter() - started > GLOBAL_TIMEOUT_SECONDS:
+        slog.warning("global_timeout", session_id=session_id, elapsed=f"{perf_counter() - started:.1f}s")
+        latency_ms = round((perf_counter() - started) * 1000, 2)
+        return ChatResponse(
+            answer="抱歉，请求处理超时，请稍后重试或简化您的问题。",
+            route=route,
+            trace_id=trace.trace_id,
+            steps=trace.steps,
+            citations=[],
+            sql_result=None,
+            metrics=Metrics(
+                latency_ms=latency_ms,
+                tool_calls=trace.tool_calls,
+                citations=0,
+                route_confidence=confidence,
+            ),
+            memory=MemoryInfo(
+                session_id=session_id,
+                recent_turns=len(memory.recent_turns),
+                conversation_summary=memory.conversation_summary,
+                user_profile=_stringify_user_profile(memory.user_profile),
+            ),
+            requires_approval=False,
+            approval_context=None,
+        )
+
     graph = build_graph()
     config = {"configurable": {"thread_id": session_id}}
-
-    # 构建结构化 PromptContext
-    prompt_ctx = build_context(memory)
 
     # ═══════════════════════════════════════
     # 真正 HITL：区分首次 invoke 和恢复 invoke
@@ -1143,6 +1321,33 @@ def run_agent(request: ChatRequest) -> ChatResponse:
         initial["route_reason"] = reason
         initial["route_confidence"] = confidence
         result = graph.invoke(initial, config)
+
+    # ── 全局超时检查（图执行后） ──
+    if perf_counter() - started > GLOBAL_TIMEOUT_SECONDS:
+        slog.warning("global_timeout_after_graph", session_id=session_id, elapsed=f"{perf_counter() - started:.1f}s")
+        latency_ms = round((perf_counter() - started) * 1000, 2)
+        return ChatResponse(
+            answer="抱歉，请求处理超时，请稍后重试或简化您的问题。",
+            route=route,
+            trace_id=trace.trace_id,
+            steps=trace.steps,
+            citations=[],
+            sql_result=None,
+            metrics=Metrics(
+                latency_ms=latency_ms,
+                tool_calls=trace.tool_calls,
+                citations=0,
+                route_confidence=confidence,
+            ),
+            memory=MemoryInfo(
+                session_id=session_id,
+                recent_turns=len(memory.recent_turns),
+                conversation_summary=memory.conversation_summary,
+                user_profile=_stringify_user_profile(memory.user_profile),
+            ),
+            requires_approval=False,
+            approval_context=None,
+        )
 
     # 检查图是否被 interrupt() 挂起
     interrupt_info = result.get("__interrupt__") if result else None
@@ -1214,7 +1419,20 @@ def run_agent(request: ChatRequest) -> ChatResponse:
         )
 
     answer = result.get("answer_text", "")
-    update_memory(memory, request.message, answer)
+
+    # ── Output Guard: 输出安全检查 ──
+    output_guard = OutputGuard()
+    output_result = output_guard.check(
+        answer=answer,
+        route=result.get("route", "sql"),
+        sql_rows=result.get("sql_rows", []),
+        citations=result.get("citations_data", []),
+    )
+    if not output_result.passed:
+        slog.warning("output_guard_triggered", session_id=session_id, reason=output_result.reason)
+        answer = "抱歉，生成的回复内容需要审核，请稍后重试。"
+
+    update_memory(memory, request_message, answer)
 
     trace.add(
         "update_memory",

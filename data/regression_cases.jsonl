@@ -1,0 +1,15 @@
+{"id":"reg-001","question":"4月服装退款率是多少？","expected_route":"sql","expected_keywords":["退款率"],"expected_tools":["execute_readonly_sql"],"difficulty":"easy","category":"smoke"}
+{"id":"reg-002","question":"退款率指标口径是什么？","expected_route":"rag","expected_keywords":["退款率","口径"],"expected_tools":["retrieve_docs"],"difficulty":"easy","category":"smoke"}
+{"id":"reg-003","question":"4月服装退款率为什么升高？结合数据和退款政策分析。","expected_route":"hybrid","expected_keywords":["退款率","政策"],"expected_tools":["execute_readonly_sql","retrieve_docs"],"difficulty":"medium","category":"smoke"}
+{"id":"reg-004","question":"退款超过7天还能处理吗？","expected_route":"rag","expected_keywords":["退款","超时","天"],"expected_tools":["retrieve_docs"],"difficulty":"easy","category":"smoke"}
+{"id":"reg-005","question":"4月工单最多的原因是什么？","expected_route":"sql","expected_keywords":["工单","原因"],"expected_tools":["execute_readonly_sql"],"difficulty":"easy","category":"smoke"}
+{"id":"reg-006","question":"随便看看","expected_route":"clarification","expected_keywords":["补充"],"expected_tools":[],"difficulty":"easy","category":"smoke"}
+{"id":"reg-007","question":"4月退款最多的商品有哪些？","expected_route":"sql","expected_keywords":["退款","商品"],"expected_tools":["execute_readonly_sql"],"difficulty":"easy","category":"smoke"}
+{"id":"reg-008","question":"售后处理标准流程是什么？","expected_route":"rag","expected_keywords":["售后","流程","SOP"],"expected_tools":["retrieve_docs"],"difficulty":"easy","category":"smoke"}
+{"id":"reg-009","question":"5月数码类订单数是多少？","expected_route":"sql","expected_keywords":["订单","数码"],"expected_tools":["execute_readonly_sql"],"difficulty":"easy","category":"smoke"}
+{"id":"reg-010","question":"会员等级对退款政策有什么影响？","expected_route":"rag","expected_keywords":["会员","退款"],"expected_tools":["retrieve_docs"],"difficulty":"medium","category":"smoke"}
+{"id":"reg-011","question":"3月鞋靴类退款金额总计多少？","expected_route":"sql","expected_keywords":["退款","金额","鞋靴"],"expected_tools":["execute_readonly_sql"],"difficulty":"easy","category":"smoke"}
+{"id":"reg-012","question":"品控抽检触发条件是什么？结合4月数据分析。","expected_route":"hybrid","expected_keywords":["品控","抽检"],"expected_tools":["execute_readonly_sql","retrieve_docs"],"difficulty":"hard","category":"smoke"}
+{"id":"reg-013","question":"物流时效说明","expected_route":"rag","expected_keywords":["物流","时效"],"expected_tools":["retrieve_docs"],"difficulty":"easy","category":"smoke"}
+{"id":"reg-014","question":"4月各类目退款率排行","expected_route":"sql","expected_keywords":["退款率","排行"],"expected_tools":["execute_readonly_sql"],"difficulty":"medium","category":"smoke"}
+{"id":"reg-015","question":"差评处理规范是什么？","expected_route":"rag","expected_keywords":["差评","处理"],"expected_tools":["retrieve_docs"],"difficulty":"easy","category":"smoke"}

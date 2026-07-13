@@ -17,6 +17,15 @@ from app.services.rag import (
     select_rag_profile,
 )
 
+# LangSmith traceable — 仅在包已安装时启用
+try:
+    from langsmith import traceable as _ls_traceable
+except ImportError:  # pragma: no cover
+    def _ls_traceable(*_args: Any, **_kwargs: Any):  # type: ignore[no-redef]
+        def _wrap(fn):  # type: ignore[no-untyped-def]
+            return fn
+        return _wrap
+
 
 RagRoute = Literal["manual", "dense", "hybrid", "deep"]
 LLM_ROUTER_PROFILES = {"dense-neighbor", "hybrid-neighbor", "mqe-hybrid-neighbor"}
@@ -74,6 +83,7 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     return payload
 
 
+@_ls_traceable(name="RAG LLM Router", tags=["rag", "router", "llm"])
 def _llm_route_query(query: str) -> tuple[str, RagSwitches, str, float]:
     if not settings.siliconflow_api_key:
         raise RuntimeError("SILICONFLOW_API_KEY is required for LLM router")

@@ -29,6 +29,15 @@ from app.schemas.chat import Citation
 from app.services.chroma_store import query_chroma
 from app.services.chunking import TextChunk, load_document_chunks
 
+# LangSmith traceable — 仅在包已安装时启用
+try:
+    from langsmith import traceable as _ls_traceable
+except ImportError:  # pragma: no cover
+    def _ls_traceable(*_args: Any, **_kwargs: Any):  # type: ignore[no-redef]
+        def _wrap(fn):  # type: ignore[no-untyped-def]
+            return fn
+        return _wrap
+
 RagSwitches = dict[str, bool]
 
 RAG_PROFILE_SWITCHES: dict[str, RagSwitches] = {
@@ -472,6 +481,7 @@ _MQE_PROMPT = """你是一个搜索查询优化器。将用户问题扩展为 3 
 输出 3 行："""
 
 
+@_ls_traceable(name="MQE expand", tags=["rag", "mqe"])
 def _mqe_expand_llm(question: str) -> list[str]:
     """调用 LLM 生成多个查询变体。失败时回退到规则扩展。"""
     if not settings.siliconflow_api_key:
@@ -618,6 +628,7 @@ _RERANK_PROMPT = """你是一个搜索相关性评估器。根据用户问题，
 """
 
 
+@_ls_traceable(name="LLM Rerank", tags=["rag", "rerank"])
 def _llm_rerank(
     question: str, records: list[dict[str, Any]], top_k: int
 ) -> list[dict[str, Any]]:

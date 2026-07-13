@@ -1,4 +1,6 @@
 import logging
+import os
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
@@ -6,6 +8,16 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.chat import router as chat_router
 from app.core.config import settings
+
+# ── LangSmith 可观测性初始化 ───────────────────────────────────────────
+if settings.langsmith_tracing and settings.langsmith_api_key:
+    os.environ["LANGSMITH_TRACING"] = "true"
+    os.environ["LANGSMITH_API_KEY"] = settings.langsmith_api_key
+    os.environ["LANGSMITH_ENDPOINT"] = settings.langsmith_endpoint
+    os.environ["LANGSMITH_PROJECT"] = settings.langsmith_project
+    logging.getLogger(__name__).info(
+        "LangSmith tracing enabled, project=%s", settings.langsmith_project
+    )
 
 app = FastAPI(
     title="Ecommerce After-sales Copilot API",

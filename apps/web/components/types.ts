@@ -54,6 +54,7 @@ export type Message = {
   role: "user" | "assistant";
   content: string;
   response?: ChatResponse;
+  isStreaming?: boolean;
 };
 
 export type Session = {
@@ -73,4 +74,29 @@ export const routeLabels: Record<ChatResponse["route"], string> = {
   rag: "RAG 知识检索",
   hybrid: "Hybrid 混合分析",
   clarification: "追问澄清",
+};
+
+/** Tracks the in-progress state while an SSE stream is being consumed. */
+export type StreamingState = {
+  route: string;
+  routeReason: string;
+  answer: string;
+  statusText: string;
+  sqlGenerated: boolean;
+  sqlExecuting: boolean;
+  sqlRowCount: number | null;
+  citationCount: number | null;
+  steps: TraceStep[];
+};
+
+export const initialStreamingState: StreamingState = {
+  route: "",
+  routeReason: "",
+  answer: "",
+  statusText: "思考中...",
+  sqlGenerated: false,
+  sqlExecuting: false,
+  sqlRowCount: null,
+  citationCount: null,
+  steps: [],
 };

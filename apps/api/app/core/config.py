@@ -43,6 +43,13 @@ class Settings(BaseSettings):
     agent_router_mode: str = "hybrid"
     agent_router_confidence_threshold: float = 0.88
     agent_enable_answer_guard: bool = True
+    agent_global_timeout: float = 60.0  # Agent 全局超时（秒）
+
+    # LangSmith 可观测性
+    langsmith_tracing: bool = False
+    langsmith_api_key: str = ""
+    langsmith_project: str = "copilot"
+    langsmith_endpoint: str = "https://api.smith.langchain.com"
 
     model_config = SettingsConfigDict(
         env_file=API_DIR / ".env",
